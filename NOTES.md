@@ -118,3 +118,78 @@ will not inherit this.
 
 **Not committed.** Harness screenshots live in the session scratchpad rather than
 `docs/`, because `docs/` was outside the writable paths set for this task.
+
+## 2026-09-01 — Task: obstacles, AABB collision and scoring
+
+**What changed.** The game became playable end to end: obstacles scroll, hitting
+one kills the run, passing one scores.
+
+**Files.**
+
+- `lib/game/geometry.dart` (new) — `Box` with the axis-aligned overlap test and
+  the `Obstacle` value type. Still plain Dart, no Flame, no Flutter.
+- `lib/game/game_model.dart` — `GapPattern` typedef, obstacle constants, scroll,
+  spawn, despawn, collision and scoring.
+- `test/game_model_test.dart` — 15 more tests, 31 total. No existing test changed.
+- `lib/dev/harness.dart` — draws obstacles and score; HUD rewritten (below).
+- `lib/dev/README.md` — documents the HARNESS log line and the box stretching.
+- `docs/harness-ready.png`, `docs/harness-scored.png` — evidence frames.
+
+**Design decisions.**
+
+- Gap positions arrive through an injected `double Function(int index)` rather
+  than `Random`. Tests pass a fixed sequence and get exact, repeatable
+  collisions; the harness passes a hash-based scatter that looks random and
+  replays identically. Same trick as `dt`: the varying thing is a parameter.
+- Each obstacle carries its own `scored` flag, so passing it can count exactly
+  once no matter how many ticks follow.
+- An obstacle is two boxes — the space the gap is not — so one overlap test
+  covers both pipes.
+
+Constants: `carX 0.30`, `carWidth 0.10`, `carHeight 0.05`, `obstacleWidth 0.16`,
+`scrollSpeed 0.45`, `obstacleSpacing 0.60`, `gapHeight 0.28`, `gapMargin 0.08`.
+
+**Commands.**
+
+```
+flutter analyze                                    -> No issues found! (ran in 5.3s)
+flutter test                                       -> 00:00 +31: All tests passed!
+flutter build apk --debug -t lib/dev/harness.dart  -> Built app-debug.apk in 18.2s
+adb install -r ...                                 -> Success
+```
+
+On device:
+
+```
+HARNESS state=ready   score=0 pipes=0
+HARNESS state=playing score=1 pipes=2
+```
+
+**Three things went wrong, and the third is the one worth remembering.**
+
+1. *Tap cadence.* Driving the game needs a flap period near where one impulse
+   cancels a period of gravity: `T = 2 * 0.72 / 2.2 = 0.655s`. Tapping from the
+   PC costs about 300ms per `adb` round trip, so an intended 0.58s sleep was
+   really ~0.9s and the car sank onto the floor every run. An earlier on-device
+   loop was faster than hover and flew into the ceiling. Fixed by tapping
+   on-device in a separate process and sweeping cadences; 0.55s scored.
+
+2. *The HUD was painted underneath the obstacles.* The harness called
+   `super.render(canvas)` and then drew the world on top, so a pipe crossing the
+   readout hid the score entirely. Fixed by splitting into a world layer and a
+   HUD layer with explicit priorities, and giving the HUD an opaque backing
+   panel — ordering alone would still leave white text on bright green.
+
+3. *The score detector was measuring the wrong thing.* To confirm scoring
+   without reading digits off an image by eye, a script compared the framebuffer
+   rectangle holding the "score:" text against its score-0 baseline. It fired —
+   and it was wrong. The rectangle had changed because a pipe had scrolled over
+   it. Obstacles traverse every x, so no on-screen region is safe from that, and
+   the detector could not distinguish "the score changed" from "something drew
+   on top of the score".
+
+   Fixed by making the harness emit `HARNESS state=… score=… pipes=…` to the log
+   on change, and verifying against that line instead. The lesson is not about
+   Flame: a detector that can fire for a reason unrelated to what it claims to
+   measure will eventually do so, and the run where it fires is the run you
+   believe it. Reading a number beats inferring one from pixels.
