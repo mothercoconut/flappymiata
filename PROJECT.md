@@ -15,4 +15,5 @@ Repo: https://github.com/mothercoconut/flappymiata
 Emulator AVD: csc4330 (Android 16, sdk 36, x86_64, google_apis)
 Application id: com.allen.flappymiata
 Due: Friday 2026-09-04 17:00
+Dev harness: lib/dev/ is a DISPOSABLE test rig with its own entrypoint (flutter run -t lib/dev/harness.dart). Not the game UI. Delete once lib/ui/ renders the model.
 Last updated: 2026-09-01
