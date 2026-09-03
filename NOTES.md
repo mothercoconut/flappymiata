@@ -32,11 +32,18 @@ adb install -r ...           -> Success
 
 Two things went wrong on the emulator and neither was a code problem:
 
-1. The emulator process exited on its own partway through the Gradle build, so
-   the install step got `adb.exe: no devices/emulators found` even though
-   `adb devices` had listed it seconds earlier. Rebuilding was unnecessary — the
-   APK was already on disk. Booting the emulator and installing inside one short
-   window worked.
+1. The emulator disappeared partway through the Gradle build, so the install
+   step got `adb.exe: no devices/emulators found` even though `adb devices` had
+   listed it seconds earlier. Rebuilding was unnecessary — the APK was already
+   on disk. Booting the emulator and installing inside one short window worked.
+
+   CORRECTION, 2026-09-03: this entry originally said the emulator "exited on
+   its own", and treated it as an unexplained defect. It was not. The emulator
+   window was being closed by hand between commands. There is no emulator bug
+   here, and nobody should go looking for one. The practical lesson survives
+   unchanged — build the APK first, then boot and install inside one short
+   window — but the reason is that a person may close the window, not that the
+   process is unstable.
 
 2. On a cold boot the emulator restores its snapshot, and it reports
    `sys.boot_completed=1` *before* that restore has finished. An `adb install`
