@@ -193,3 +193,50 @@ HARNESS state=playing score=1 pipes=2
    Flame: a detector that can fire for a reason unrelated to what it claims to
    measure will eventually do so, and the run where it fires is the run you
    believe it. Reading a number beats inferring one from pixels.
+
+## 2026-09-03 — Task: wire the game model into the real entrypoint
+
+**Why.** `lib/main.dart` drew a text label and never imported `lib/game`. The
+game existed only behind the dev harness entrypoint, so `flutter run` produced
+nothing playable and there was no stable app to test new components against.
+
+**What changed.** `lib/main.dart` only.
+
+- Ticks the model from Flame's `update(dt)`.
+- Tap flaps while ready or playing, and resets when dead.
+- Draws the car and obstacles from the model's own boxes, converting normalised
+  0..1 coordinates to pixels at render time.
+- Score on a HUD layer above the world, on an opaque backing.
+
+Deliberately plain — flat colours, rectangles, no sprites, no menus. `lib/ui/`
+is untouched so the real UI has somewhere to go.
+
+**Commands.**
+
+```
+flutter analyze                       -> No issues found! (ran in 4.3s)
+flutter test                          -> 00:00 +31: All tests passed!
+flutter build apk --debug             -> Built app-debug.apk in 15.6s
+adb install -r ...                    -> Success
+adb shell pidof com.allen.flappymiata -> 8083
+```
+
+On device the default entrypoint reached `score: 1` under a scripted tap loop at
+a 0.55s cadence. Frames in `docs/app-ready.png` and `docs/app-playing.png`.
+
+**The one thing carried over from the harness on purpose.** The score renders on
+a HUD layer with an explicit priority and an opaque backing. Obstacles scroll the
+full width of the screen, so there is no safe corner — anything drawn under them
+is covered periodically. The harness hit this because it painted the world after
+`super.render`, which no component priority can fix. Repeating the fix here was
+cheaper than rediscovering the bug.
+
+**What was left out, deliberately.** The harness's debug readout (y, velocity,
+dt, pipe count), its `HARNESS` log line, the kill-line markers and the
+scored-pipe dimming. Those are instrumentation for watching the model, not part
+of the app.
+
+**Backend status: framework complete, not closed.** Physics, state machine,
+obstacles, collision and scoring all work and are covered by 31 tests. Not
+present: high-score persistence, a difficulty ramp, pause, and sound hooks. None
+of those are required for this project.
