@@ -112,7 +112,7 @@ jobs:
 
     steps:
       - name: Check out the commit under test
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install the pinned Flutter SDK
         uses: subosito/flutter-action@v2
@@ -160,7 +160,7 @@ jobs:
 
     steps:
       - name: Check out the commit under test
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install the pinned Flutter SDK
         uses: subosito/flutter-action@v2
@@ -192,7 +192,7 @@ jobs:
 
     steps:
       - name: Check out the commit under test
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install JDK ${{ env.JAVA_VERSION }} for Gradle
         uses: actions/setup-java@v4
@@ -287,7 +287,7 @@ jobs:
 
     steps:
       - name: Check out the commit under test
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install the pinned Flutter SDK
         uses: subosito/flutter-action@v2
@@ -326,7 +326,7 @@ jobs:
 
     steps:
       - name: Check out the commit under test
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install the pinned Flutter SDK
         uses: subosito/flutter-action@v2
