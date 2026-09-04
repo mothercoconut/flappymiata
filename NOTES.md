@@ -309,3 +309,89 @@ dimension; subtracting it lands exactly on the computed size.
 the hitbox *area* roughly constant, not because 0.031 feels right. The danger
 window grew from 0.578s to 0.720s as a result. Phase 2's simulator measures
 whether that is actually harder; until then it is an assumption.
+
+## 2026-09-03 — Phase 2: headless simulator and a fairness proof
+
+**Bar 1 closed.** Every course the game can generate is provably clearable.
+
+**Files.** `tool/headless_sim.dart`, `tool/fairness.dart`, `tool/simulate.dart`,
+`tool/prove_fairness.dart`, `test/headless_sim_test.dart`,
+`test/fairness_prover_test.dart`. `lib/game/` unchanged — the prover needed
+nothing exposed. No dependency added.
+
+**Why not just play it a lot.** Sampling policies can show a course IS
+survivable; it can never show one is not. "No policy I tried worked" reported as
+"unfair" would be a guess. So the prover does a reachability search: advance
+frame by frame carrying the SET of reachable non-colliding states, branching each
+on flap/no-flap. Empty set before the course ends means no input sequence
+survives it.
+
+**The insight that makes it cheap.** `flap()` ASSIGNS velocity instead of adding
+to it. So after any flap velocity is exactly `flapImpulse`, and between flaps it
+is determined by frames elapsed. State is `(y, framesSinceFlap)`, not `(y, any
+velocity)`. Better still, reachable y values land on an exact lattice of spacing
+`gravity * dt^2 = 6.1111e-4`, so nothing is rounded at all — the state is two
+integers. That lattice is 19.6x finer than the largest one-frame move
+(`|flapImpulse * dt| = 0.012`), which is the resolution a grid would have needed
+just to avoid stepping over a pipe lip.
+
+**Which way it errs.** Survival tests demand 1e-9 of clearance, six orders finer
+than a lattice cell and four coarser than float noise. The prover can call a fair
+course unfair; it cannot certify an unfair one.
+
+**The prover was made to fail before it was trusted.**
+
+```
+pinhole            gap 0.020 vs car 0.031    UNSURVIVABLE  gapNarrowerThanCar
+zigzag             0.22 -> 0.78 in 0.36      UNSURVIVABLE  unreachable
+above-the-ceiling  gap centred at y = -0.20  UNSURVIVABLE  gapOutsidePlayfield
+overlap-clash      extremes 0.20 apart       UNSURVIVABLE  overlappingGapsDisjoint
+wide-open          one centred full gap      SURVIVABLE, witness replayed
+```
+
+Each is impossible for a different reason and the prover names the mechanism,
+not just the verdict. A second, independent hash-set search agrees on all five.
+The `wide-open` witness is not a claim: 116 frames and 26 taps replayed through
+the real `GameModel` and survived with score 1.
+
+**The check that found a wrong assumption.** The single-obstacle survivability
+threshold is NOT `carHeight`. An obstacle straddles the car for 43 frames and
+gravity does not pause during them, so the gap must admit the car plus the
+flattest 43-frame trajectory that exists:
+
+```
+flattest 43-frame excursion   0.086889
+threshold must be             0.117889 = carHeight + excursion
+prover flips at               0.118111   (within one 6.111e-4 lattice cell)
+```
+
+That expectation was wrong when first written and the check caught it; the
+expectation was fixed, not the prover. It is now the strongest test in the suite
+precisely because it pins the answer to a number computed outside the prover,
+and lands nowhere near 0.031 — where a prover that only asked "does the car fit
+through the hole" would flip.
+
+**Results.**
+
+```
+10000 windows of 3 obstacles   PASS 10000  FAIL 0
+worst course #4186             gaps 0.775, 0.227, 0.633
+tightest margin                0.06021 playfield-heights (1.94 car-heights)
+continuous 10000-obstacle run  SURVIVABLE, 800036 frames, peak 51124 states
+bottleneck                     obstacle 4187 (0.227) -> 4188 (0.633)
+12930 searches                 107.6 s
+```
+
+Both methods agree on the same bottleneck. Margin means: how much fatter the car
+could be, on every side, with the course still clearable.
+
+**Gate.** `test/fairness_prover_test.dart` runs 400 windows plus a continuous
+150-obstacle run, about 2s of the suite. The full 10,000 stays
+`dart run tool/prove_fairness.dart`.
+
+**Known limits, stated rather than buried.** `minimumExcursion` searches patterns
+of at most 2 flaps, so it is an upper bound — the safe direction. Margin is
+measured to pipes only, not to the playfield edges, so a path that survives by
+hugging the ceiling would not show up in that number. Exactness is in real
+arithmetic; the 1e-9 epsilon is a well-founded argument that float drift cannot
+flip a verdict, not a proof about IEEE doubles.
