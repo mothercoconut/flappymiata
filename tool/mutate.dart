@@ -80,7 +80,7 @@ const List<String> tier1Tests = <String>[
 ];
 
 /// TIER 2 — the escalation. An empty argument list means "every test file",
-/// which is what `flutter test` does with no paths: all 57 tests, including
+/// which is what `flutter test` does with no paths: the whole suite, including
 /// `fairness_prover_test.dart` (whose prover re-derives the model's physics and
 /// so can see constant changes tier 1 might not) and `widget_test.dart`.
 const List<String> tier2Tests = <String>[];
@@ -1231,11 +1231,12 @@ String sha256Hex(List<int> data) {
 /// Exit status: 0 clean, 1 survivors (or a failed self-test), 2 the tool itself
 /// could not do its job.
 ///
-/// WHY THIS IS SET RATHER THAN RETURNED: Dart uses a `main` return value as the
-/// process exit code only for a SYNCHRONOUS `int main()`. An async main's
-/// returned future is awaited and its value discarded, so `return 1` here would
-/// exit 0 — and a CI job wired to `--quick` would go green over a survivor. The
-/// helper below makes that impossible to forget.
+/// WHY THIS IS SET RATHER THAN RETURNED: Dart ignores a `main` return value
+/// entirely. Measured on Dart 3.13.2, BOTH `Future<int> main() async => 1;` and
+/// a synchronous `int main() => 1;` exit 0. So `return 1` here would exit 0 and
+/// a CI job wired to `--quick` would go green over a survivor. Only assigning
+/// `exitCode` (or calling `exit`) sets the status. An earlier version of this
+/// comment said the synchronous form was safe; it is not.
 Future<int> main(List<String> args) async {
   final int status = await _run(args);
   exitCode = status;

@@ -464,3 +464,71 @@ retries; a failed restore is the worst thing this tool can do.
 
 **Runtimes.** Full 410 mutants: 1265s single-worker, 345s with `--jobs=8`.
 `--quick` (54 stratified mutants for CI): 165s, ~30s parallel. Self-test: 13s.
+
+## 2026-09-03 — Phase 3b: CI that can actually fail
+
+**Bar 3.** `.github/workflows/ci.yml`, five parallel jobs on `ubuntu-latest`,
+triggered on push to `main`, PRs, and manual dispatch. Flutter pinned to 3.47.2
+rather than `latest`, so CI cannot drift out from under the project.
+
+```
+Gate 1  static-analysis    flutter analyze
+Gate 2  unit-tests         flutter test                    (82 tests)
+Gate 3  android-build      flutter build apk --debug
+Gate 4  fairness-proof     dart run tool/prove_fairness.dart
+Gate 5  mutation-testing   dart run tool/mutate.dart --selftest
+Gate 6  mutation-testing   dart run tool/mutate.dart --quick --jobs=2
+```
+
+Gates 5 and 6 share a job deliberately: `--quick`'s report only means anything
+if `--selftest` has just shown the classifier can still say SURVIVED.
+
+**Every gate was proven able to fail, locally, before being trusted.** A CI file
+that is green because its steps cannot fail is worse than no CI. Each gate was
+run green, broken, run red, restored, and run green again:
+
+```
+1  analyze   String returned from an int function        exit 1
+2  test      gravity 2.2 -> 2.3                          exit 1
+3  build     call to an undefined method                 exit 1
+4  fairness  gapHeight 0.28 -> 0.15                      exit 1  (448 courses unsurvivable)
+5  selftest  widget_test given an assertion on gravity   exit 1  (NEGATIVE control flipped to KILLED)
+6  quick     untested helper appended to geometry.dart   exit 1  (2 survivors, at the predicted lines)
+```
+
+Two of those failed *attributably* rather than by cascade. Gate 4's break left
+the prover's five impossibility controls and its physics flip-point check all
+passing — only the shipped pattern went red. Gate 5's break flipped exactly one
+of three controls, POSITIVE and INVALID unchanged; the self-test's
+discriminating power is precisely what it exists to assert.
+
+**Exit-code propagation, measured rather than assumed.** This project was
+already bitten once by a gate that could not fail, so all four shapes were run
+on Dart 3.13.2:
+
+```
+Future<int> main() async => 1;                 exits 0    <- the hazard
+int main() => 1;                               exits 0    <- ALSO the hazard
+Future<int> main() async { exitCode = 1; ... }  exits 1    <- mutate.dart
+void main() { exit(1); }                       exits 1    <- prove_fairness.dart
+```
+
+The second row corrects a comment in `tool/mutate.dart` which claimed a
+synchronous `int main()` was safe. It is not; Dart ignores main's return value
+entirely. The code was already correct, only its stated reason was wrong — and a
+comment that licenses a broken pattern is how the bug comes back.
+
+**A worry that turned out fine.** `android/.gitignore` excludes `gradlew`,
+`gradlew.bat` and `gradle-wrapper.jar`, and `settings.gradle.kts` requires
+`flutter.sdk` from the gitignored `local.properties` — so a fresh CI checkout has
+none of them. Tested by rebuilding a gitignore-accurate clean checkout and
+building there: exit 0. The Flutter tool injects `gradlew` at mode 755, injects
+the wrapper jar, and regenerates `local.properties` from `ANDROID_HOME` and
+`FLUTTER_ROOT`.
+
+**Not verified locally, and stated rather than assumed.** Linux exit-code
+propagation through the shell wrappers; the marketplace actions themselves;
+whether a 2-core runner tolerates `android/gradle.properties` asking Gradle for
+`-Xmx8G` against ~7 GB of RAM. The workflow carries a comment on how to lower it
+from `~/.gradle/gradle.properties` without editing the file the other developer
+shares.
