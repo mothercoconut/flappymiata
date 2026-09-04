@@ -615,3 +615,70 @@ the pipes, whether it reads as a ghost at all. Only the wiring is tested — it
 exists, advances in lockstep, and its positions are ones the recorded run really
 visited. Best-run persistence is in memory only; on-disk needs a storage package
 and none was added.
+
+## 2026-09-04 — CI died with SIGTERM; the fix was a missing ceiling
+
+The first CI run carrying Phase 4 failed on gates 5+6, killed with **exit 143**
+two minutes into a job with a 45-minute timeout, after 7 of 50 mutants, with 26
+seconds of unexplained silence before death. It passes locally at `--jobs=4` in
+195s. The runner's own last line: `Terminate orphan process: pid (3804)
+(dart:flutter_to)`.
+
+**The fact that pointed at the answer.** 143 is SIGTERM. The Linux OOM killer
+and `systemd-oomd` both use SIGKILL, which surfaces as **137**. So this was not
+memory exhaustion — something *asked* the process to stop.
+
+**The bug.** In `runTests`, the `.timeout()` was applied to `proc.exitCode`, and
+the very next line awaited `Future.wait([outDone, errDone])` with no ceiling at
+all. `flutter test` spawns a `flutter_tester` grandchild that INHERITS those
+pipes, and a pipe stays readable until every holder of its write end is gone. So
+once the direct child exited and the grandchild was orphaned, nothing covered
+that wait. The tool had a timeout on the part that could not hang and none on
+the part that did.
+
+`main()` already carried a comment recording this exact symptom being observed
+before — "printed its entire report at 201s and was still resident ten minutes
+later" — and the fix at that time addressed only the program's final exit, never
+the per-call wait. The same bug came back one level down.
+
+**Fixed.** The drain is bounded. `_killTree` replaces `proc.kill()`: `taskkill
+/T /F` on Windows, and on POSIX a `ps`-derived parent map walked DEEPEST-FIRST,
+because killing a parent first *creates* the orphan and reparents it beyond
+reach. A post-run sweep matches the sandbox marker on both argv and
+`/proc/<pid>/cwd`, since only `flutter_tester` carries the sandbox in its
+arguments.
+
+**Instrumented rather than guessed at.** The job now prints memory, disk, the
+filesystem backing the temp dir, and a process count before and after; samples
+resources every 3s to a file; and prints a post-mortem `ps` sorted by RSS on
+failure. The tool emits a heartbeat naming every in-flight mutant and its age.
+
+That instrumentation paid for itself before reaching CI. A local run showed:
+
+```
+[hb] +02:30  done 8/50  inflight: REL232 (120s), REL283 (89s)
+[   9/50] REL232  KILLED(t/o)  lib/game/run_code.dart:317:12  REL  '>=' -> '<'
+```
+
+`REL232` is a genuine infinite loop — a decode-loop comparison inverted. Without
+the heartbeat that is indistinguishable from "the tool hung"; with it, the stuck
+mutant names itself.
+
+**Deliberately NOT changed: `--jobs=2`, `--timeout=180`, budget 52.** Lowering
+`--jobs` costs zero detection power — the subset is fixed integer arithmetic, and
+each worker judges its own mutant in its own sandbox, so job count moves wall
+clock and nothing else. Which is exactly why it must not move in the same commit
+as the instrumentation: a green run would then teach nothing about which change
+fixed it. The release condition is written into the workflow.
+
+**Detection power given up, stated plainly.** A genuine SURVIVOR whose output is
+truncated by the now-bounded drain is misfiled as INVALID, which could hide a
+hole in the suite. It fails safe — truncation cannot manufacture a kill, since
+that needs `Some tests failed.` or a non-zero exit, and losing bytes adds
+neither. Affected mutant ids are listed with a warning. The alternative was
+hanging forever and reporting nothing.
+
+**A measurement error of my own, for the record.** My first verification run
+reported exit 255 and looked like a tool bug. It was `Select-Object -First 12`
+terminating the PowerShell pipeline, which closes dart's stdout and kills it.
+The tool was fine; the measuring instrument was not.
