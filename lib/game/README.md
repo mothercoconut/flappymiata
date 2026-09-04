@@ -22,6 +22,21 @@ and re-executing somebody else's claim possible at all.
 | File | What it owns |
 | --- | --- |
 | `game_model.dart` | The rules. Physics, the difficulty ramp, scoring, run state, and the immutable `GameModel` snapshot everything else is stated in terms of. Re-exports `geometry.dart`. |
+
+The difficulty ramp lives in `game_model.dart` as `Difficulty`, and it obeys the
+same two rules as everything else in here: **no clock and no randomness.** It is
+a pure function from PROGRESS to three numbers — scroll speed, gap height and
+spacing — so a recorded run replays frame-exactly *including how hard it was*.
+A ramp driven by elapsed seconds would have broken every replay, every verified
+score and the fairness proof in one move.
+
+It is also **bounded**. The ramp reaches its hardest setting at obstacle 50 and
+stops there, which is what makes "prove the game is fair" a question with an
+answer: there is one hardest setting to point a prover at. `tool/prove_fairness.dart`
+proves it at that setting and 5,000 obstacles past it, and prints the ramps that
+were measured and refused — one of which hands the player an unclearable course
+at obstacle 1,728, which is to say six minutes into a run, where no playtest
+would ever have found it.
 | `geometry.dart` | The shapes the rules are stated in: the normalised playfield, `Box`, and the collision test. Split out so the box maths can be checked by hand. |
 | `course_seed.dart` | Which course a run is played on, as a single integer, and how a calendar date becomes one. The course is a pure hash of (seed, obstacle index) rather than a generator, so any gap can be evaluated on its own. Seed 0 is exactly the shipped course. |
 | `replay.dart` | A whole run written down as a seed plus the frames the player tapped on, and the driver that re-executes it. Fixes the timestep and the tap-then-tick ordering, which are the two things "the same taps" is ambiguous without. |

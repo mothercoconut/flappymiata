@@ -789,3 +789,89 @@ via `ps`, so the same runaway should be caught nearer 5 GB. That is a design
 expectation and the runner is the first place it is ever tested. If the POSIX
 path is broken the failure is loud: the header says the ceiling cannot be
 enforced and `--selftest` exits 1.
+
+## 2026-09-04 — Phase 5a: screens, persistence, and a difficulty ramp that had to be proven
+
+**Files.** New `lib/ui/game_screens.dart`, `lib/ui/high_score_store.dart`,
+`tool/ramp_probe.dart`, three test files. Modified `lib/game/game_model.dart`
+(adds `Difficulty`), `lib/main.dart`, both `tool/fairness.dart` and
+`tool/prove_fairness.dart`. Tests 167 -> 230.
+
+**Dependency added: `shared_preferences ^2.2.0`.** Storing a score needs a
+writable directory that survives an app update, and finding it on Android means
+a platform channel — so "just write a file" is `path_provider` plus encoding,
+atomic writes and corrupt-file handling. Without it the best score would have
+stayed in memory, as before. `lib/game/` does not import it, and a test enforces
+that by reading the sources.
+
+The best run is stored as a **run code plus a claimed score**, and `load()`
+re-executes it through `verifyRunCode`. An edited number is rejected, and a
+record made before the ramp changed what those taps score is dropped rather than
+left as an unreachable target. That gives Phase 4's verified-score work its
+first production caller.
+
+**Pause needs no clock.** `update` simply stops asking the accumulator for
+steps, so the immutable model is untouched and paused seconds are never banked.
+A test pumps 300 paused frames and asserts the model equals
+`before.tick(1/60)` — one frame of physics from exactly where it stopped.
+
+### The ramp had to be proven, and the first one I wanted was unfair
+
+Driven by obstacles passed. Warm-up 0-10, ramps over 40, plateaus at obstacle
+50. `scrollSpeed` 0.450 -> 0.480, `gapHeight` 0.280 -> 0.252, spacing unchanged.
+
+Fairness at and beyond the plateau:
+
+```
+5000 windows from obstacle 50      0 unsurvivable, worst 0.04132 (1.33 car-heights)
+5000 windows from obstacle 5050    0 unsurvivable, worst 0.04110 (1.33)
+continuous 0 -> 10000 through ramp SURVIVABLE, tightest 0.03550
+continuous 0 -> 25000               SURVIVABLE, tightest 0.03169 (1.02) at obstacle 16760
+120 daily courses from obstacle 50 0 unsurvivable, worst 0.05449 (1.76)
+```
+
+Worst-case margin was 1.94 car-heights before the ramp; it is 1.33 now. The game
+is measurably harder.
+
+**Three candidate plateaus were rejected because the prover found walls:**
+
+```
+speed 0.6     gap 0.21   spacing 0.6    WALL at obstacle 25
+speed 0.5625  gap 0.22   spacing 0.6    WALL at obstacle 1728
+speed 0.54    gap 0.23   spacing 0.54   WALL at obstacle 370
+shipped: speed 0.48 gap 0.252 spacing 0.6   - no wall
+```
+
+Obstacle 1,728 is about six minutes into a run. The game becomes literally
+impossible there — not hard, impossible — and no playtest reaches it. That ramp
+would have shipped. `prove_fairness` PART 6 now re-runs all three rejected
+candidates on every CI run and **fails if any of them starts passing**. That is
+a regression test against a design mistake rather than a code one.
+
+Spacing was left constant as a consequence: with speed already raised,
+tightening spacing subtracts twice from the same budget — the free air that a
+worst-case climb from a low gap to a high one is paid out of.
+
+**Mutation.** 3 survivors appeared, all in `Difficulty.rampFraction`. One killed
+by an `isNegative` assertion (`0.0` -> `-0.0` is invisible through the ramp but
+visible on the fraction). Two argued equivalent: a clamp whose guard and formula
+agree at the boundary cannot distinguish `<=` from `<`, checked over 200,001
+values comparing raw IEEE-754 bit patterns, with a poisoned control that
+differed at 100,011. Back to 0 survivors.
+
+**Verified on a cold-booted emulator**, after the previous instance wedged its
+System UI — every device check earlier in this session ran on an emulator that
+had been up for hours through several memory-exhaustion events, so this one was
+started clean rather than trusted. Screens in `docs/screen-start.png` and
+`docs/screen-game-over.png`.
+
+**A bug device verification found that no test caught: the game-over card shows
+"NEW BEST" for a score of 0.** First run, you score nothing, and it congratulates
+you. The comparison treats `0 >= 0` as an improvement. Not yet fixed — recorded
+here so it is not lost.
+
+**Also observed:** 25 seconds of scripted tapping at a fixed 0.55s cadence now
+scores zero against the ramped game. That is the driver being a bad player, not
+a defect, but it does mean automated "does it still work" checks get weaker as
+the game gets harder. The fairness solver is a competent player and would make a
+far better test driver than a metronome.

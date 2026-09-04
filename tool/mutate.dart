@@ -357,7 +357,7 @@ class KnownEquivalent {
 const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 357,
+    line: 639,
     original: '<',
     replacement: '<=',
     argument:
@@ -372,7 +372,7 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   ),
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 358,
+    line: 640,
     original: '>',
     replacement: '>=',
     argument:
@@ -384,23 +384,23 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   ),
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 497,
+    line: 799,
     original: '<',
     replacement: '<=',
     argument:
         '`final double restingY = nextY < minY ? minY : maxY;`. This line is '
-        'reached ONLY under the guard on line 491, `nextY < minY || nextY > '
+        'reached ONLY under the guard on line 793, `nextY < minY || nextY > '
         'maxY`. Inside that guard nextY == minY is impossible: the first '
         'disjunct excludes it outright, and the second requires nextY > maxY, '
         'which with minY < maxY also excludes it. `<` and `<=` differ only at '
         'equality, and equality is unreachable at this point, so the ternary '
         'selects the same branch for every input that can ever reach it. '
         '(NaN cannot reach it either: every comparison against NaN is false, '
-        'so the guard on 491 is false and the line is skipped.)',
+        'so the guard on 793 is false and the line is skipped.)',
   ),
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 110,
+    line: 370,
     original: 'playfieldTop',
     replacement: '0.0',
     argument:
@@ -506,6 +506,67 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
         'and every payload length. Checked: 6,020 payloads of 0 to 300 bytes '
         'encode to byte-identical strings from either starting value.',
   ),
+  // ---------------------------------------------------------------------------
+  // Added with the difficulty ramp. Both are the SAME shape as the two
+  // `clampGapCentre` entries at the top of this list, and for the same reason:
+  //
+  //   a clamp is redundant at its own boundary. `if (x <= limit) return v;`
+  //   followed by a formula that also evaluates to `v` at x == limit is
+  //   unobservable under `<=` versus `<`, because the two arms agree on the one
+  //   input that separates them.
+  //
+  // That is a property of every CONTINUOUS clamp and cannot be restructured
+  // away: making the mutant killable would mean making the ramp jump at its own
+  // endpoints, which is a worse ramp bought with a better score.
+  //
+  // Checked as well as argued, because "I cannot think of an input that
+  // separates them" and "no input separates them" are different claims: both
+  // variants were implemented beside the original and evaluated over 200,001
+  // consecutive values of `progress` from -100,000 to 100,000, comparing raw
+  // IEEE-754 BIT PATTERNS (not `==`, which cannot see the two zeros apart) of
+  // `rampFraction` and of all three ramped settings it feeds. Zero differences.
+  // The same harness run against a deliberately poisoned variant — the fraction
+  // plus 1e-18 — reported 100,011 differences, so the comparison is known to be
+  // capable of seeing one.
+  //
+  // A THIRD mutant of this function, `return 0.0` -> `-0.0`, was NOT argued
+  // equivalent and is not listed here. It is unobservable through the ramp for
+  // the same reason `replay.dart`'s carry is — the sign is multiplied away —
+  // but it IS observable on the fraction itself, so it is killed by an
+  // `isNegative` assertion in `test/difficulty_test.dart` instead. An
+  // equivalence argument is the last resort, not the first.
+  KnownEquivalent(
+    file: 'lib/game/game_model.dart',
+    line: 259,
+    original: '<=',
+    replacement: '<',
+    argument:
+        'Difficulty.rampFraction: `if (progress <= warmUpObstacles) return '
+        '0.0;`. The two versions differ on exactly one input, progress == '
+        'warmUpObstacles. The mutant falls through to the next guard, which is '
+        'false there because warmUpObstacles < plateauObstacle, and reaches '
+        '`(progress - warmUpObstacles) / rampObstacles` — which is 0 / 40, and '
+        '0 / 40 is POSITIVE zero, the same double the original returns. For '
+        'every other input the condition has the same truth value. Checked over '
+        '200,001 values of progress by bit pattern, on the fraction and on all '
+        'three settings it feeds: zero differences.',
+  ),
+  KnownEquivalent(
+    file: 'lib/game/game_model.dart',
+    line: 260,
+    original: '>=',
+    replacement: '>',
+    argument:
+        'Difficulty.rampFraction: `if (progress >= plateauObstacle) return '
+        '1.0;`. The mirror of the case above. They differ only at progress == '
+        'plateauObstacle, where the mutant falls through to '
+        '`(plateauObstacle - warmUpObstacles) / rampObstacles` — which is '
+        'rampObstacles / rampObstacles by the definition of plateauObstacle, '
+        'and an integer divided by itself is exactly 1.0 in IEEE-754 for every '
+        'value rampObstacles can hold. Same double the original returns. '
+        'Covered by the same 200,001-value bit-pattern check.',
+  ),
+
   KnownEquivalent(
     file: 'lib/game/run_code.dart',
     line: 511,

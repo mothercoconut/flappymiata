@@ -28,6 +28,9 @@ import 'package:flutter/widgets.dart';
 import 'package:flappymiata/game/course_seed.dart';
 import 'package:flappymiata/game/game_model.dart';
 import 'package:flappymiata/game/replay.dart';
+import 'package:flappymiata/game/run_code.dart';
+import 'package:flappymiata/ui/game_screens.dart';
+import 'package:flappymiata/ui/high_score_store.dart';
 
 // -----------------------------------------------------------------------------
 // DRAW ORDER.
@@ -163,14 +166,26 @@ class FlappyMiataApp extends StatelessWidget {
 /// because a tap anywhere on screen should count. A `FlameGame` is itself a
 /// Component and reports every point inside the canvas as its own, so the whole
 /// surface becomes the tap target with no invisible button to size or place.
-class FlappyMiataGame extends FlameGame with TapCallbacks {
+class FlappyMiataGame extends FlameGame
+    with TapCallbacks
+    implements GameScreenHost {
   /// Which course this session plays. Fixed for the life of the game object, so
   /// a restart puts the player on the same obstacles — otherwise "beat your
   /// ghost" would be a different question every attempt.
   final int courseSeed;
 
-  FlappyMiataGame({int? courseSeed})
-    : courseSeed = courseSeed ?? todaysCourseSeed();
+  /// Where the best score is kept between sessions.
+  ///
+  /// INJECTED rather than constructed here, because the real one talks to a
+  /// platform plugin and `flutter test` has no platform under it. A widget test
+  /// hands in [InMemoryHighScoreStore] and gets a game that behaves identically
+  /// without touching a disk — including the "the app has been played before"
+  /// case, which is otherwise impossible to set up.
+  final HighScoreStore highScoreStore;
+
+  FlappyMiataGame({int? courseSeed, HighScoreStore? highScoreStore})
+    : courseSeed = courseSeed ?? todaysCourseSeed(),
+      highScoreStore = highScoreStore ?? SharedPreferencesHighScoreStore();
 
   /// The live run: the model, plus the record of which frames were taps.
   ///
@@ -197,17 +212,45 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
   /// a verified score all rest on. See `lib/game/replay.dart`.
   final FixedStepAccumulator _clock = FixedStepAccumulator();
 
-  /// The best run of this session, kept so the next one can race it.
+  /// The best run ON THIS COURSE, kept so the next one can race it.
   ///
-  /// IN MEMORY ONLY, and deliberately: writing it to disk would mean a storage
-  /// dependency, and this repo does not add one without being asked. The
-  /// replay is a seed plus a list of small integers — a run code, which
-  /// `lib/game/run_code.dart` will already turn into a short string — so
-  /// persisting it later is a one-line change to this field and nothing else.
-  Replay? _bestRun;
+  /// Separate from [_bestScore], and the distinction is worth stating because
+  /// merging the two was the first version of this and it was wrong: the ghost
+  /// has to be a run of the SAME obstacles or it is racing a different game,
+  /// while the best score is the player's record and belongs to the player
+  /// rather than to a course. On the daily challenge those are different things
+  /// every day.
+  Replay? _ghostSource;
 
-  /// The score [_bestRun] achieved.
+  /// The score [_ghostSource] achieved.
+  int _ghostScore = 0;
+
+  /// The best score ever recorded on this device, across every course.
+  ///
+  /// Loaded from [highScoreStore] at start-up and written back the moment it is
+  /// beaten. Only ever increases within a session.
   int _bestScore = 0;
+
+  /// False until a best score is known, so the screens can tell "no best yet"
+  /// from a best of zero. A best of zero is a real thing — a run that died
+  /// before the first pipe — and showing it as "BEST 0" is honest where showing
+  /// nothing would be a lie about a game that has been played.
+  bool _hasBestScore = false;
+
+  /// Whether the world is stopped.
+  ///
+  /// THIS IS THE WHOLE OF PAUSING, and it needs no clock, no timer and no new
+  /// state in the model. Time reaches the game in exactly one way — `tick(dt)`,
+  /// called from [update] — so not calling it IS pausing. The model is immutable,
+  /// so the snapshot the renderer is holding stays exactly what it was and
+  /// resuming continues from it rather than from anything reconstructed.
+  ///
+  /// Note what is NOT done here: the accumulator is not asked for steps while
+  /// paused, so the seconds spent on the pause screen are never banked and
+  /// cannot be spent as a burst of catch-up frames on the way out. `RunState`
+  /// has three values and none of them is `paused`, on purpose — stopping the
+  /// world is a rendering decision, and this is the renderer.
+  bool _paused = false;
 
   /// The recorded best run, being replayed alongside the live one.
   ///
@@ -225,6 +268,89 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
 
   /// The ghost's snapshot, or null when there is nothing to race.
   GameModel? get ghostModel => _ghost?.model;
+
+  // ---------------------------------------------------------------------------
+  // GameScreenHost — everything the screens in `lib/ui/` are allowed to see.
+  //
+  // Getters only, plus four verbs. There is no way through this interface to
+  // reach the model or the replay, which is what stops a screen growing a rule.
+  // ---------------------------------------------------------------------------
+
+  /// Bumped when a screen's CONTENT changes without the screen itself changing.
+  ///
+  /// The only case in this game is the best score arriving from storage after
+  /// the start screen is already up. Everything else a screen displays changes
+  /// at the same moment the screen does, and Flame rebuilds an overlay when the
+  /// active set changes.
+  final ValueNotifier<int> _revision = ValueNotifier<int>(0);
+
+  @override
+  Listenable get revision => _revision;
+
+  @override
+  int get score => _run.model.score;
+
+  @override
+  int get bestScore => _bestScore;
+
+  @override
+  bool get hasBestScore => _hasBestScore;
+
+  @override
+  bool get paused => _paused;
+
+  /// The first tap of a run, from the start screen.
+  ///
+  /// Queued through the recorder rather than applied to the model, exactly as a
+  /// tap on the playfield is: input has to land on the fixed frame grid or the
+  /// run cannot be written down. See [onTapDown].
+  @override
+  void startRun() {
+    if (_run.finished) return;
+    _run.tap();
+    _syncScreens();
+  }
+
+  @override
+  void pauseRun() {
+    // Only a live run can be paused. Pausing on the start line or after a crash
+    // would put up a screen with nothing behind it to resume.
+    if (_paused || _run.model.state != RunState.playing) return;
+    _paused = true;
+    _syncScreens();
+  }
+
+  @override
+  void resumeRun() {
+    if (!_paused) return;
+    _paused = false;
+    _syncScreens();
+  }
+
+  @override
+  void restartRun() {
+    _paused = false;
+    _startRun();
+    _syncScreens();
+  }
+
+  /// Puts the right screen up for the state the game is in.
+  ///
+  /// Called after every input and once per frame. The diff against
+  /// [gameScreenOverlays] is what makes calling it every frame free: Flame's
+  /// `add`/`remove` return without notifying when the set is already right, so
+  /// the widget tree is rebuilt only when the screen genuinely changes.
+  void _syncScreens() {
+    final Set<String> wanted =
+        overlaysFor(state: _run.model.state, paused: _paused);
+    for (final String name in gameScreenOverlays) {
+      if (wanted.contains(name)) {
+        overlays.add(name);
+      } else {
+        overlays.remove(name);
+      }
+    }
+  }
 
   /// The car sprite, loaded once and shared by the two layers that draw a car.
   ///
@@ -260,6 +386,10 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
     // checked at all until this stopped being awaited.
     unawaited(_loadCarSprite());
 
+    // The screens own themselves. This file says which ones exist and, in
+    // `_syncScreens`, which one is up; it does not lay any of them out.
+    registerGameScreens(this, this);
+
     _panel = _ScorePanel();
     // Added in this order for readability only. The priorities the classes
     // carry are what actually decide who covers whom, so reordering these
@@ -281,9 +411,19 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
       await add(_DebugOverlay());
     }
 
-    // So the "tap to start" hint is on screen for the very first frame, rather
-    // than appearing only once `update` has run once.
+    // So the score and the start screen are on screen for the very first frame,
+    // rather than appearing only once `update` has run once.
     _panel.text = _hudText;
+    _syncScreens();
+
+    // Started only now that [_panel] exists, because the load writes to it when
+    // it lands. Same argument as the sprite for not awaiting it: reading a
+    // preferences store goes through a platform channel, and a game that will
+    // not start until a disk answers is a game that can be held up by one.
+    // Everything above already copes with there being no best score — that is
+    // the state a fresh install is in — so the answer is folded in whenever it
+    // arrives.
+    unawaited(_loadBestScore());
   }
 
   /// Decodes the car sprite into [carImage].
@@ -298,6 +438,57 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
     codec.dispose();
   }
 
+  /// Reads the stored best run, if there is one that checks out.
+  ///
+  /// The store re-executes the run before handing it back (see
+  /// `lib/ui/high_score_store.dart`), so anything that arrives here is a score
+  /// somebody really got. A record that no longer verifies — a hand-edited
+  /// number, or a run recorded before the difficulty ramp changed what those
+  /// taps score — comes back null and is simply not shown.
+  ///
+  /// THE GHOST IS ONLY REVIVED ON A MATCHING COURSE. A run code carries its own
+  /// seed, and racing a recording made on a different course would put a car on
+  /// screen flying through pipes that are not there.
+  Future<void> _loadBestScore() async {
+    final BestRun? stored = await highScoreStore.load();
+    if (stored == null) return;
+
+    // A later run may already have finished and beaten it while the load was in
+    // flight. Taking the larger keeps this from ever moving the number down.
+    if (!_hasBestScore || stored.score > _bestScore) {
+      _bestScore = stored.score;
+      _hasBestScore = true;
+    }
+
+    final Replay? replay = stored.replay;
+    if (replay != null &&
+        replay.seed == courseSeed &&
+        (_ghostSource == null || stored.score > _ghostScore)) {
+      _ghostSource = replay;
+      _ghostScore = stored.score;
+
+      // Put it on the track for the run that is about to start, not only for
+      // the one after that. `_startRun` is the other place a ghost is created,
+      // and it is not called for the FIRST run of a session — so without this
+      // line a player who came back to beat yesterday's run would have to throw
+      // one away before the thing they came to race appeared.
+      //
+      // Guarded on `ready`, because a load that landed mid-run would otherwise
+      // drop a ghost into the middle of the track from a standing start.
+      if (_run.model.state == RunState.ready) {
+        _ghost = _ghostPlayerFor(replay);
+      }
+    }
+    _panel.text = _hudText;
+
+    // The start screen is ALREADY on screen by the time this lands, and it is
+    // showing "no best yet". An overlay is rebuilt when the set of ACTIVE
+    // overlays changes, and that set has not changed — so this is the one place
+    // the screens have to be told about a change they cannot see for
+    // themselves. See [GameScreenHost.revision].
+    _revision.value++;
+  }
+
   /// A tap means "flap" during a run and "start again" once the run is over.
   ///
   /// The tap is QUEUED rather than applied here. A touch handler fires whenever
@@ -306,14 +497,28 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
   /// therefore lands the tap on the next fixed step — which is also what the
   /// model would have done anyway, since a flap assigns velocity and two flaps
   /// inside one frame produce exactly one flap's worth of motion.
+  ///
+  /// REACHED ONLY WHILE A RUN IS LIVE, now that there are screens: the start,
+  /// paused and game-over overlays each cover the surface and consume their own
+  /// taps. The `finished` branch is kept anyway, because it is the behaviour the
+  /// game has always had and the one thing that must not change is what a tap on
+  /// the PLAYFIELD means. If a screen ever fails to appear, the game is still
+  /// playable rather than stuck.
   @override
   void onTapDown(TapDownEvent event) {
+    // A tap that arrives while the world is stopped is not an input to the run.
+    // It cannot normally happen — the paused screen is over the whole surface —
+    // but a flap queued here would be spent the instant the game resumed, on a
+    // frame the player was not looking at.
+    if (_paused) return;
+
     if (_run.finished) {
       _startRun();
     } else {
       _run.tap();
     }
     _panel.text = _hudText;
+    _syncScreens();
   }
 
   /// Begins a fresh run on the same course, and puts the best run so far on the
@@ -321,87 +526,120 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
   void _startRun() {
     _run = ReplayRecorder(seed: courseSeed);
 
-    final Replay? best = _bestRun;
-    if (best == null) {
-      _ghost = null;
-      return;
-    }
-    final ReplayPlayer ghost = ReplayPlayer(best);
+    final Replay? best = _ghostSource;
+    _ghost = best == null ? null : _ghostPlayerFor(best);
+  }
 
-    // SKIP THE GHOST'S OWN THINKING TIME. A recording includes every frame from
-    // the moment the run object was created, including however long its player
-    // sat looking at the "tap to start" screen. Those frames do nothing — the
-    // model is `ready` and `tick` returns the receiver — but replaying them
-    // would leave the ghost idling on the start line while the live car drove
-    // off. Fast-forwarding to the frame of its first tap lines the two runs up
-    // at the moment each of them actually began, which is the only alignment
-    // that makes a race mean anything.
-    //
-    // A recording with NO taps never began at all, so the whole thing is
-    // lead-in: the ghost is wound to its end and parks on the start line, which
-    // is exactly where that run spent every frame of its life.
+  /// A replay driver for [best], wound forward to the frame that run began on.
+  ///
+  /// SKIP THE GHOST'S OWN THINKING TIME. A recording includes every frame from
+  /// the moment the run object was created, including however long its player
+  /// sat looking at the start screen. Those frames do nothing — the model is
+  /// `ready` and `tick` returns the receiver — but replaying them would leave
+  /// the ghost idling on the start line while the live car drove off.
+  /// Fast-forwarding to the frame of its first tap lines the two runs up at the
+  /// moment each of them actually began, which is the only alignment that makes
+  /// a race mean anything.
+  ///
+  /// A recording with NO taps never began at all, so the whole thing is lead-in:
+  /// the ghost is wound to its end and parks on the start line, which is exactly
+  /// where that run spent every frame of its life.
+  ///
+  /// ONE FUNCTION, TWO CALLERS — a restart, and a best run arriving from storage
+  /// while the player is still on the start line. A second copy of the
+  /// fast-forward would be a second chance to line the race up differently.
+  ReplayPlayer _ghostPlayerFor(Replay best) {
+    final ReplayPlayer ghost = ReplayPlayer(best);
     final int leadIn =
         best.tapFrames.isEmpty ? best.frames : best.tapFrames.first;
     for (int i = 0; i < leadIn; i++) {
       ghost.step();
     }
-    _ghost = ghost;
+    return ghost;
   }
 
   @override
   void update(double dt) {
     super.update(dt);
 
-    // THE ONE PLACE REAL TIME ENTERS. Flame measures how long the frame took;
-    // the accumulator turns that into a whole number of fixed steps, and the
-    // model never learns that a clock was involved. That indirection is why an
-    // identical run can be replayed exactly in a test where no real time passes
-    // at all — and why the ghost stays in step with the live car on a device
-    // that stutters.
-    final int steps = _clock.stepsFor(dt);
-    for (int i = 0; i < steps; i++) {
-      _run.step();
-
-      // The ghost only moves once the live run has actually started. Until the
-      // first tap the live car is frozen on the start line, and a ghost that
-      // set off without it would be racing nobody.
-      if (_run.model.state != RunState.ready) {
-        _ghost?.step();
-      }
-    }
-
-    // THE FIRST FINISHED RUN IS ALWAYS KEPT, however badly it went. A ghost
-    // that only appeared once somebody scored would leave the player with
-    // nothing to race on exactly the attempts where a reference would help
-    // most, and "my previous attempt" is the comparison a player is actually
-    // making in their head.
+    // PAUSING IS THIS LINE. The accumulator is not asked for steps, so `tick`
+    // is never called and the model — being immutable — is still exactly the
+    // snapshot it was when the player hit pause. Resuming picks that snapshot
+    // up rather than rebuilding anything, because there is nothing to rebuild.
     //
-    // Idempotent: after the first capture `_bestRun` is non-null and
-    // `score > _bestScore` is false, so this does nothing on every later frame.
-    // No "have I already saved this" flag to get out of step with the thing it
-    // is describing.
-    if (_run.finished && (_bestRun == null || _run.model.score > _bestScore)) {
-      _bestScore = _run.model.score;
-      _bestRun = _run.replay;
+    // The real seconds that pass while paused are not banked either: they are
+    // never handed to the accumulator at all, so the game cannot come out of a
+    // pause owing itself a burst of catch-up frames.
+    if (!_paused) {
+      // THE ONE PLACE REAL TIME ENTERS. Flame measures how long the frame took;
+      // the accumulator turns that into a whole number of fixed steps, and the
+      // model never learns that a clock was involved. That indirection is why an
+      // identical run can be replayed exactly in a test where no real time
+      // passes at all — and why the ghost stays in step with the live car on a
+      // device that stutters.
+      final int steps = _clock.stepsFor(dt);
+      for (int i = 0; i < steps; i++) {
+        _run.step();
+
+        // The ghost only moves once the live run has actually started. Until the
+        // first tap the live car is frozen on the start line, and a ghost that
+        // set off without it would be racing nobody.
+        if (_run.model.state != RunState.ready) {
+          _ghost?.step();
+        }
+      }
+
+      _captureFinishedRun();
     }
 
     _panel.text = _hudText;
+    _syncScreens();
   }
 
-  /// The score, the best of the session, and a hint in the two states where the
-  /// game is waiting on the player. No hint while playing: it would be one more
-  /// thing sitting over the pipes with nothing left to say.
+  /// Files a finished run: as the ghost for the next attempt, and — if it beat
+  /// the record — as the stored best.
+  ///
+  /// Runs on every frame after the run ends and is idempotent, by the same trick
+  /// it always used: after the first pass `_ghostSource` is non-null and
+  /// `score > _ghostScore` is false, so the body does nothing. No "have I
+  /// already saved this" flag to get out of step with the thing it describes.
+  ///
+  /// THE FIRST FINISHED RUN IS ALWAYS KEPT AS THE GHOST, however badly it went.
+  /// A ghost that only appeared once somebody scored would leave the player with
+  /// nothing to race on exactly the attempts where a reference would help most.
+  /// The BEST SCORE is not kept that way — it only moves upward — because a
+  /// record that a bad run could lower is not a record.
+  void _captureFinishedRun() {
+    if (!_run.finished) return;
+    final int score = _run.model.score;
+
+    if (_ghostSource == null || score > _ghostScore) {
+      _ghostScore = score;
+      _ghostSource = _run.replay;
+    }
+
+    if (!_hasBestScore || score > _bestScore) {
+      _bestScore = score;
+      _hasBestScore = true;
+      // Stored as a RUN, not as a number: `lib/ui/high_score_store.dart` plays
+      // it back on load and only believes the score if the run really produces
+      // it. Fire and forget — a write that fails must not interrupt a game.
+      unawaited(
+        highScoreStore.save(
+          BestRun(score: score, code: encodeRunCode(_run.replay)),
+        ),
+      );
+    }
+  }
+
+  /// The score and the record, on the panel that stays up during play.
+  ///
+  /// The hints that used to live here — "tap to start", "tap to restart" — have
+  /// moved to the screens in `lib/ui/`, which are on screen in exactly the two
+  /// states that used to show them and have room to say more than three words.
   String get _hudText {
     final String score = 'score: ${_run.model.score}';
-    final String best = _bestRun == null ? '' : '\nbest: $_bestScore';
-    switch (_run.model.state) {
-      case RunState.ready:
-        return '$score$best\ntap to start';
-      case RunState.playing:
-        return '$score$best';
-      case RunState.dead:
-        return '$score$best\ntap to restart';
-    }
+    return _hasBestScore ? '$score\nbest: $_bestScore' : score;
   }
 }
 
@@ -742,8 +980,8 @@ class _DebugOverlay extends Component with HasGameReference<FlappyMiataGame> {
   }
 }
 
-/// The score and hint text on an opaque backing panel, at [_hudPriority] —
-/// above everything the world layer draws.
+/// The score and record on an opaque backing panel, at [_hudPriority] — above
+/// everything the world layer draws.
 ///
 /// WHY THE BACKING IS NOT DECORATION: priority fixes the ordering, and ordering
 /// alone does not fix legibility. Pale glyphs sitting directly on the bright
@@ -751,6 +989,14 @@ class _DebugOverlay extends Component with HasGameReference<FlappyMiataGame> {
 /// stay hard to read even once they are unmistakably in front. An opaque
 /// rectangle underneath makes the colour behind the text a known quantity no
 /// matter what is passing beneath it.
+///
+/// WHAT CAME OUT OF THIS CLASS WHEN THE SCREENS ARRIVED: a second, centred card
+/// that said READY / TAP TO DRIVE and RUN OVER / TAP TO RESTART. `lib/ui/` now
+/// puts a real screen in exactly those two states, over the top of this one, so
+/// the canvas card was drawing underneath an opaque widget and saying the same
+/// thing twice. This panel is the in-play HUD and nothing else; the screens are
+/// in `lib/ui/game_screens.dart` and they reuse this card's colours, radius and
+/// dropped border so the two read as one design.
 class _ScorePanel extends PositionComponent
   with HasGameReference<FlappyMiataGame> {
   _ScorePanel()
@@ -772,7 +1018,6 @@ class _ScorePanel extends PositionComponent
   /// alpha quietly reintroduces the unreadable-score problem, and it would only
   /// show up in the handful of frames a pipe spends behind the text.
   static final Paint _backing = Paint()..color = const Color(0xE812263D);
-  static final Paint _cardBacking = Paint()..color = const Color(0xF20A1D32);
   static final Paint _cardBorder = Paint()
     ..color = const Color(0xFF8BD3C7)
     ..style = PaintingStyle.stroke
@@ -789,19 +1034,6 @@ class _ScorePanel extends PositionComponent
         color: Color(0xFFFFFFFF),
         fontSize: 20.0,
         height: 1.4,
-      ),
-    ),
-  );
-
-  final TextComponent _stateReadout = TextComponent(
-    anchor: Anchor.center,
-    textRenderer: TextPaint(
-      style: const TextStyle(
-        color: Color(0xFFFFFFFF),
-        fontSize: 26.0,
-        fontWeight: FontWeight.w800,
-        height: 1.25,
-        letterSpacing: 1.5,
       ),
     ),
   );
@@ -827,20 +1059,12 @@ class _ScorePanel extends PositionComponent
         _readout.size.y + _padding * 2,
       );
     }
-    switch (game.model.state) {
-      case RunState.ready:
-        _stateReadout.text = 'READY\nTAP TO DRIVE';
-      case RunState.playing:
-        _stateReadout.text = '';
-      case RunState.dead:
-        _stateReadout.text = 'RUN OVER\nTAP TO RESTART';
-    }
   }
 
   @override
   Future<void> onLoad() async {
     await super.onLoad();
-    await addAll(<Component>[_readout, _stateReadout]);
+    await add(_readout);
   }
 
   @override
@@ -851,23 +1075,5 @@ class _ScorePanel extends PositionComponent
     );
     canvas.drawRRect(scoreRect.shift(const Offset(0, 4)), _cardBorder);
     canvas.drawRRect(scoreRect, _backing);
-
-    if (game.model.state == RunState.playing) return;
-
-    _stateReadout.position = Vector2(game.size.x / 2, game.size.y * 0.42);
-    final double cardWidth = game.size.x * 0.72;
-    final double cardHeight = 116;
-    final Rect cardRect = Rect.fromLTWH(
-      (game.size.x - cardWidth) / 2,
-      game.size.y * 0.33,
-      cardWidth,
-      cardHeight,
-    );
-    final RRect card = RRect.fromRectAndRadius(
-      cardRect,
-      const Radius.circular(16),
-    );
-    canvas.drawRRect(card.shift(const Offset(0, 6)), _cardBorder);
-    canvas.drawRRect(card, _cardBacking);
   }
 }
