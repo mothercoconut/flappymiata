@@ -1165,3 +1165,15 @@ with no build error. The pubspec comment says so at the line that would change.
 **Not measurable here.** Everything on physical hardware. The emulator
 rasterises in software, so 15 ms of raster is perhaps 1-2 ms on a real GPU. The
 shape of the distribution transfers; the absolute milliseconds do not.
+
+### Ratified 2026-09-04
+
+The two changes flagged for ratification are approved and stay: `cupertino_icons`
+removed from `pubspec.yaml`, and `uses-material-design` set to false. Together
+they saved 672,737 bytes.
+
+The trip-wire stands and is worth repeating here because it is silent: the moment
+any file imports `flutter/material.dart` and draws an `Icon`, it renders as an
+empty box with no build error and no test failure. Nothing in the repo currently
+imports material. The pubspec carries the warning at the line that would have to
+change.
