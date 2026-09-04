@@ -72,6 +72,8 @@ class _Host implements GameScreenHost {
   @override
   bool assistEnabled = false;
   @override
+  bool ghostEnabled = true;
+  @override
   MotionSetting motionSetting;
   @override
   bool systemDisablesAnimations;
@@ -83,6 +85,8 @@ class _Host implements GameScreenHost {
 
   @override
   void toggleAssist() => calls.add('assist');
+  @override
+  void toggleGhost() => calls.add('ghost');
   @override
   void cycleMotion() => calls.add('motion');
   @override

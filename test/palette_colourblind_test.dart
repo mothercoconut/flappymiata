@@ -262,9 +262,16 @@ void main() {
       WidgetTester tester,
     ) async {
       // THE PAIR THAT MATTERS MOST TO A PLAYER: two cars on screen at once, one
-      // of which is theirs. The ghost is drawn as a flat silhouette rather than
-      // a faded copy of the sprite precisely so it cannot be mistaken for the
-      // car — this is that claim, measured.
+      // of which is theirs.
+      //
+      // WHAT THIS TEST CAN AND CANNOT SETTLE, because a player report showed
+      // exactly where the line is. It was green while the ghost was a filled
+      // silhouette of the same sprite, and a player still could not tell the
+      // two apart — because ΔE₀₀ is a distance between two COLOURS and the
+      // problem was a SHAPE. The colour check is necessary and it is not
+      // sufficient: it says the ghost will not vanish into the car, and it
+      // cannot say the ghost will not be mistaken for one. The shape claim is
+      // asserted in `test/ghost_render_test.dart`, on pixels.
       final SpriteColours car = await spriteFor(tester);
       final List<String> failures = <String>[];
       double worst = double.infinity;
@@ -275,7 +282,7 @@ void main() {
         palette.pipeBody,
         palette.hill,
       ]) {
-        final int ghost = composite(palette.ghostSilhouette, backdrop);
+        final int ghost = composite(palette.ghostOutline, backdrop);
         for (final Dichromacy? vision in visions) {
           int see(int c) => vision == null ? c : simulateDichromacy(c, vision);
           final double d = colourDifference(see(ghost), see(car.mean));

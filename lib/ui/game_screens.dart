@@ -227,6 +227,18 @@ abstract class GameScreenHost {
   /// Turns the flap-window highlight on or off. Off is the default.
   void toggleAssist();
 
+  /// Whether the recorded best run is being drawn beside the live car.
+  ///
+  /// A DISPLAY SETTING AND NOTHING ELSE, on the same terms as [assistEnabled].
+  /// The ghost is a replay of a run that has already happened; hiding it hides
+  /// a picture and removes nothing from the run being played, and
+  /// `test/ghost_render_test.dart` asserts that by playing one input sequence
+  /// both ways and comparing the models.
+  bool get ghostEnabled;
+
+  /// Shows or hides the recorded best run. On is the default.
+  void toggleGhost();
+
   /// What the player has asked for about decorative motion.
   ///
   /// Defaults to [MotionSetting.system], which follows the platform's own
@@ -541,6 +553,8 @@ class StartScreen extends StatelessWidget {
         const SizedBox(height: 12),
         AssistToggle(host: host),
         const SizedBox(height: 12),
+        GhostToggle(host: host),
+        const SizedBox(height: 12),
         MotionToggle(host: host),
       ],
     );
@@ -568,6 +582,32 @@ class AssistToggle extends StatelessWidget {
     return GameButton(
       label: host.assistEnabled ? 'ASSIST: ON' : 'ASSIST: OFF',
       onPressed: host.toggleAssist,
+    );
+  }
+}
+
+/// The ghost switch, offered on the same two screens and for the same reasons
+/// as [AssistToggle] — a display setting whose label has to be read, and
+/// reading a label during a run costs the run.
+///
+/// WHY THE GAME HAS THIS CONTROL AT ALL: a player said the ghost made it hard
+/// to tell which car was his. The drawing changed in response (see
+/// `_GhostLayer` in `lib/main.dart`), and a redrawn ghost is still somebody
+/// else's car on the player's track — so the answer to "I do not want that
+/// there" should not be "look at it again, it is better now". The label states
+/// the CURRENT state, like the other two, so the answer to "is it on?" is one
+/// glance.
+class GhostToggle extends StatelessWidget {
+  /// The game.
+  final GameScreenHost host;
+
+  const GhostToggle({super.key, required this.host});
+
+  @override
+  Widget build(BuildContext context) {
+    return GameButton(
+      label: host.ghostEnabled ? 'GHOST: ON' : 'GHOST: OFF',
+      onPressed: host.toggleGhost,
     );
   }
 }
@@ -624,6 +664,8 @@ class PausedScreen extends StatelessWidget {
         GameButton(label: 'RESTART', onPressed: host.restartRun),
         const SizedBox(height: 12),
         AssistToggle(host: host),
+        const SizedBox(height: 12),
+        GhostToggle(host: host),
         const SizedBox(height: 12),
         MotionToggle(host: host),
       ],

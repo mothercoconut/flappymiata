@@ -1177,3 +1177,73 @@ any file imports `flutter/material.dart` and draws an `Icon`, it renders as an
 empty box with no build error and no test failure. Nothing in the repo currently
 imports material. The pubspec carries the warning at the line that would have to
 change.
+
+## 2026-09-04 — The ghost was illegible, and only a player could tell
+
+Playtest feedback, verbatim: *"not sure i like the ghost. it makes it really
+hard to see what's you and what's the ghost."*
+
+**My brief for the fix was wrong.** I wrote that the ghost drew the same Miata
+sprite tinted. It did not — it was already a flat teal silhouette at 55%,
+flattened through `ColorFilter.mode(..., BlendMode.srcIn)`, with a comment
+arguing for it. I asserted that from memory without opening the file, and the
+first remedy I suggested was the status quo.
+
+The complaint was right anyway, and the real diagnosis is sharper: **a
+silhouette is the car's outline filled in, so it is a second car-shaped mass no
+matter what colour it is painted.** The eye segments a moving scene into masses
+first and colours them second. A colour rides on top of a shape; it cannot
+replace one.
+
+**The number that proves no gate could have caught this:**
+
+```
+ghost vs the live car   19.02 ΔE00   — a PASS, against a bar of 15
+```
+
+The colourblind gate scored that pair as comfortably distinguishable while a
+player could not tell which car he was driving. ΔE00 measures colour. The defect
+was shape. Six hundred lines of computed colour rigour, three simulations and
+fourteen graded pairs, and the thing that found the bug was somebody playing it
+for five minutes.
+
+**The fix.** The ghost is now a hollow stroked capsule around the same footprint
+— no sprite, no fill, nothing inside. A stroke has no mass, so it reads as a
+marking on the scene rather than a thing in it. It also stops hiding the course
+behind it, survives the frames where the two overlap, and needs no sprite so it
+draws before `miatasprite.png` has decoded. Alpha rose 55% -> 85%, because a fill
+covers thousands of pixels and can afford to be faint while a 3px stroke cannot.
+
+Re-graded, normal / deuteranopia / protanopia:
+
+```
+ghost vs a pipe        19.22/20.53/18.88  ->  27.63/29.54/27.27
+ghost vs the sky       32.00/28.39/30.74  ->  51.92/48.02/51.56
+ghost vs the live car             19.02   ->  29.17
+```
+
+`palette.ghostSilhouette` was renamed `ghostOutline` — the old name had become a
+lie.
+
+**A toggle**, `GHOST: ON`/`OFF`, beside `ASSIST` and `MOTION` on the start and
+paused screens. Default on; `lib/main.dart:550` `bool _ghostVisible = true;` is
+the single line that flips it. The replay keeps stepping while hidden, since the
+switch is reachable mid-run from the paused screen and a stopped ghost would
+reappear seconds behind the race.
+
+**Observability, because nobody had ever watched it draw.** The good driver never
+dies so it records nothing; the bad driver's run is over in two seconds.
+`tool/ghost_run.dart` now plays a watchable run and prints a 132-character run
+code, and `--dart-define=BEST_RUN=<code>` opens the app with it already filed as
+the best — the seed travels inside the code, so one flag sets the course and the
+run. `tool/ghost_shot.dart` renders comparison PNGs with no device at all.
+
+**The test that cannot be fooled by a tolerance.** `ghost_render_test.dart`
+renders the frame twice, ghost shown and hidden, and takes the differing pixels
+— by construction exactly what the ghost painted, with no colour to match. It
+asserts the middle is empty and there is ink on all four sides. Flipping
+`PaintingStyle.stroke` back to `fill` fires it: *696 pixels in the middle of the
+ghost were painted*.
+
+What none of it proves is whether it reads correctly while both are moving. A
+still cannot answer the axis the complaint was about.

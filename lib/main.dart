@@ -193,6 +193,100 @@ const bool kShowCollisionBoxes = false;
 /// the other.
 const bool kAutopilot = bool.fromEnvironment('AUTOPILOT');
 
+// -----------------------------------------------------------------------------
+// SEEDING A BEST RUN, so the ghost can be LOOKED AT.
+//
+// ============================================================================
+// THE PROBLEM THIS SOLVES, WHICH IS NOT A TESTING PROBLEM
+// ============================================================================
+//
+// The ghost is the recording of the best run on this course. So seeing one on a
+// device requires already having finished a run on today's course worth
+// replaying — and nobody had. `tool/solver_bot.dart` plays well enough but
+// never dies, so it produces no finished run; a weak driver's run is over in
+// two seconds and produces a ghost that falls off the bottom of the screen
+// before the first pipe arrives. The ghost had therefore never been WATCHED by
+// anybody, on any device, which is exactly how a rendering defect survives a
+// green suite.
+//
+// So the app can be handed a run to open with:
+//
+//     dart run tool\ghost_run.dart
+//     flutter run --dart-define=BEST_RUN=<the code it printed>
+//
+// and the very first run of that session has a real ghost beside it, on the
+// right course, from the first frame.
+//
+// ============================================================================
+// WHY IT ALSO SETS THE COURSE, AND WHY IT DOES NOT TOUCH THE DEVICE'S RECORD
+// ============================================================================
+//
+// A run code carries its own seed and the ghost is only revived on a MATCHING
+// course (see [FlappyMiataGame._loadBestScore]). A flag that needed a second
+// flag beside it to work would fail by showing nothing at all, which is
+// indistinguishable from the bug it exists to help find — so the seed comes out
+// of the code rather than being asked for again.
+//
+// And the record goes into an [InMemoryHighScoreStore], never the platform one.
+// A debugging flag that wrote a fabricated best score into the player's own
+// preferences would leave something behind after the build that set it was
+// gone.
+//
+// FREE IN A NORMAL BUILD by the same mechanism as [kAutopilot]: with no
+// `--dart-define` this is a const empty string, so `kSeededBestRun.isEmpty` is
+// a compile-time true and everything the other branch reaches is dropped.
+// -----------------------------------------------------------------------------
+
+/// A run code to open the app with, as if it were already the stored best.
+const String kSeededBestRun = String.fromEnvironment('BEST_RUN');
+
+/// [code] as a [BestRun], or null if it does not read as a run.
+///
+/// THE SCORE IS RE-DERIVED, NOT ASKED FOR. `lib/ui/high_score_store.dart`
+/// exists because a claimed score is not evidence; replaying the run and taking
+/// what it actually produces means this record cannot claim anything the run
+/// does not, so the seeded ghost and the seeded BEST on the start screen are
+/// the same run by construction.
+///
+/// PUBLIC AND PURE so it can be tested without a special build:
+/// `--dart-define` cannot be set from inside `flutter test`, so a test that
+/// could only exercise this through [kSeededBestRun] would be a test that never
+/// runs.
+BestRun? bestRunFromCode(String code) {
+  if (code.isEmpty) return null;
+  final Replay? replay = decodeRunCode(code).replay;
+  if (replay == null) return null;
+  return BestRun(score: replayFinalModel(replay).score, code: code);
+}
+
+/// The run [kSeededBestRun] names, or null in every ordinary build.
+///
+/// A top-level `final` rather than a getter, so the decode happens lazily and
+/// exactly once however many games are constructed.
+final BestRun? seededBestRun = bestRunFromCode(kSeededBestRun);
+
+/// Which course a game plays when the caller does not say.
+///
+/// A seeded run wins, because it names the only course it can be raced on. The
+/// autopilot comes next, because a frame-time measurement must not change at
+/// midnight. Otherwise: today's.
+int defaultCourseSeed() =>
+    seededBestRun?.replay?.seed ??
+    (kAutopilot ? classicCourseSeed : todaysCourseSeed());
+
+/// Where a game keeps its best run when the caller does not say.
+///
+/// Both debugging paths deliberately land in memory rather than on the device:
+/// see the block comment above, and see [kAutopilot] on why a measurement must
+/// not be able to inherit a ghost from an earlier session.
+HighScoreStore defaultHighScoreStore() {
+  final BestRun? seeded = seededBestRun;
+  if (seeded != null) return InMemoryHighScoreStore(seeded);
+  return kAutopilot
+      ? InMemoryHighScoreStore()
+      : SharedPreferencesHighScoreStore();
+}
+
 void main() {
   // Both statements are inside a `kAutopilot` branch the compiler removes from
   // a normal build, so `main` in a shipped APK is the single `runApp` it has
@@ -288,18 +382,14 @@ class FlappyMiataGame extends FlameGame
   final HighScoreStore highScoreStore;
 
   FlappyMiataGame({int? courseSeed, HighScoreStore? highScoreStore})
-    : // An explicit argument always wins — the tests pass both, and the
-      // autopilot must not be able to overrule a caller that said what it
-      // wanted. Only the DEFAULTS change under [kAutopilot], and both of them
-      // change for the same reason: a frame-time measurement has to be
-      // repeatable, so neither the calendar nor whatever is left in the
-      // device's preferences may decide what gets drawn.
-      courseSeed =
-          courseSeed ?? (kAutopilot ? classicCourseSeed : todaysCourseSeed()),
-      highScoreStore = highScoreStore ??
-          (kAutopilot
-              ? InMemoryHighScoreStore()
-              : SharedPreferencesHighScoreStore());
+    : // An explicit argument always wins — the tests pass both, and neither
+      // debugging flag must be able to overrule a caller that said what it
+      // wanted. Only the DEFAULTS move, and they move for the same reason in
+      // both cases: what gets drawn has to be decidable from the build rather
+      // than from the calendar or from whatever is left in the device's
+      // preferences. See [defaultCourseSeed] and [defaultHighScoreStore].
+      courseSeed = courseSeed ?? defaultCourseSeed(),
+      highScoreStore = highScoreStore ?? defaultHighScoreStore();
 
   /// The live run: the model, plus the record of which frames were taps.
   ///
@@ -439,6 +529,26 @@ class FlappyMiataGame extends FlameGame
   /// simulation, it is the recording being executed.
   ReplayPlayer? _ghost;
 
+  /// Whether the ghost is drawn.
+  ///
+  /// ============================================================================
+  /// THIS ONE LINE IS THE DEFAULT. Change `true` to `false` and the game ships
+  /// with the ghost switched off; nothing else has to move.
+  /// ============================================================================
+  ///
+  /// It defaults ON because the player who asked for the switch has only seen
+  /// the version that was hard to read. Shipping it off would be answering a
+  /// question he has not been asked yet — he objected to a second car on the
+  /// track, not to the idea of racing his own record — so the fixed version
+  /// gets shown to him and the switch is there for the moment he decides
+  /// otherwise.
+  ///
+  /// A DISPLAY SETTING AND NOTHING ELSE, exactly like [toggleAssist] and
+  /// [cycleMotion]: it is read by one `render` method and by nothing else in
+  /// this file. There is no path from it to `_run`, to `tick` or to the
+  /// recorder.
+  bool _ghostVisible = true;
+
   /// Read-only view of the live snapshot, for anything that draws.
   ///
   /// Public so that `lib/ui/` can render from it without this file handing out
@@ -502,6 +612,9 @@ class FlappyMiataGame extends FlameGame
   bool get assistEnabled => _assist != null;
 
   @override
+  bool get ghostEnabled => _ghostVisible;
+
+  @override
   MotionSetting get motionSetting => _motionSetting;
 
   @override
@@ -548,6 +661,26 @@ class FlappyMiataGame extends FlameGame
       _assistPlan = null;
       _advice = null;
     }
+    _syncScreens();
+    _revision.value++;
+  }
+
+  /// Shows or hides the recorded best run.
+  ///
+  /// THE REPLAY KEEPS RUNNING WHILE IT IS HIDDEN, and that is deliberate rather
+  /// than an oversight. The switch is reachable from the PAUSED screen, so it
+  /// can be pressed in the middle of a run — and a ghost that had been stopped
+  /// while hidden would reappear on the frame it was switched off on, several
+  /// seconds behind the race it is supposed to be part of. Stepping it either
+  /// way costs one `tick` of an immutable model per frame and keeps "turn it
+  /// back on" honest.
+  ///
+  /// Nothing about the live run is touched: no `_run`, no `tap`, no `tick`.
+  /// `test/ghost_render_test.dart` asserts that by playing the same inputs with
+  /// the ghost shown and hidden and requiring the two runs to be equal.
+  @override
+  void toggleGhost() {
+    _ghostVisible = !_ghostVisible;
     _syncScreens();
     _revision.value++;
   }
@@ -605,12 +738,12 @@ class FlappyMiataGame extends FlameGame
     }
   }
 
-  /// The car sprite, loaded once and shared by the two layers that draw a car.
+  /// The car sprite.
   ///
-  /// Owned here rather than by either layer because both need it and neither
-  /// owns the other. Loading it twice would put the same 286x120 image in
-  /// memory twice and, worse, let the two layers disagree about whether it had
-  /// finished loading.
+  /// Owned here rather than by [_CarLayer], which is now its only reader,
+  /// because loading is an `onLoad` concern and the layer has no `onLoad` of
+  /// its own. It was shared with [_GhostLayer] until the ghost stopped drawing
+  /// the sprite at all.
   ui.Image? carImage;
 
   late final _ScorePanel _panel;
@@ -1562,6 +1695,34 @@ class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
 /// only thing left to choose.
 const double _spriteOversize = 1.10;
 
+/// The pixels a car occupies on screen: its hitbox, converted, then grown by
+/// [_spriteOversize] about its own centre.
+///
+/// Centred rather than anchored to an edge, so the forgiveness is even: the
+/// extra 10% hangs off the nose and the tail equally, and off the roof and the
+/// sills equally.
+///
+/// ONE FUNCTION, THREE CALLERS, for the same reason [_toPixels] is one
+/// function. The live car is drawn into this rect, the ghost's outline is drawn
+/// around it, and `test/ghost_render_test.dart` reads pixels out of it — so all
+/// three are talking about the same rectangle by construction. A second copy of
+/// this arithmetic that drifted by a pixel would make the ghost a picture of a
+/// slightly different game, and would make the test's verdict a statement about
+/// somewhere the renderer never drew.
+///
+/// PUBLIC for that third caller. An instrument that computes its own idea of
+/// where the thing it is measuring ought to be can disagree with the thing it
+/// measures, which is the failure [_toPixels] already argues is worse than
+/// having no instrument at all.
+Rect carFootprint(Box box, Vector2 screen) {
+  final Rect carRect = _toPixels(box, screen);
+  return Rect.fromCenter(
+    center: carRect.center,
+    width: carRect.width * _spriteOversize,
+    height: carRect.height * _spriteOversize,
+  );
+}
+
 /// Draws the car sprite into the hitbox [box], scaled by one number on both
 /// axes.
 ///
@@ -1572,15 +1733,6 @@ const double _spriteOversize = 1.10;
 /// from `carSpriteAspect` — so drawing into the box IS drawing at the right
 /// shape, and the only decision left is how much bigger the picture is than the
 /// box: [_spriteOversize], one constant, one meaning.
-///
-/// Centred rather than anchored to an edge, so the forgiveness is even: the
-/// extra 10% hangs off the nose and the tail equally, and off the roof and the
-/// sills equally.
-///
-/// ONE FUNCTION, TWO CALLERS, for the same reason [_toPixels] is one function:
-/// the ghost has to be drawn exactly where the live car would have been on that
-/// frame of its run. A second copy of this arithmetic that drifted by a pixel
-/// would make the ghost a picture of a slightly different game.
 void _drawCar(
   Canvas canvas,
   ui.Image image,
@@ -1588,16 +1740,10 @@ void _drawCar(
   Vector2 screen,
   Paint paint,
 ) {
-  final Rect carRect = _toPixels(box, screen);
-  final Rect visualRect = Rect.fromCenter(
-    center: carRect.center,
-    width: carRect.width * _spriteOversize,
-    height: carRect.height * _spriteOversize,
-  );
   canvas.drawImageRect(
     image,
     Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
-    visualRect,
+    carFootprint(box, screen),
     paint,
   );
 }
@@ -1626,6 +1772,15 @@ class _CarLayer extends Component with HasGameReference<FlappyMiataGame> {
   }
 }
 
+/// How thick the ghost's outline is drawn, in logical pixels.
+///
+/// The same 3 the score panel's border and every screen card's border already
+/// use, so the ghost is visibly part of the same set of drawn-on markings
+/// rather than part of the scenery. Named because
+/// `test/ghost_render_test.dart` has to know how far in from the footprint's
+/// edge "the interior" starts before it can assert the interior is empty.
+const double ghostStrokeWidth = 3.0;
+
 /// The recorded best run, driving the same course at the same time.
 ///
 /// Sits at [_ghostPriority]: over the pipes, so it can be seen at all, and
@@ -1633,34 +1788,97 @@ class _CarLayer extends Component with HasGameReference<FlappyMiataGame> {
 /// player is actually steering. That ordering is the whole design requirement
 /// for this component, and it is expressed as two numbers rather than as the
 /// order of two `canvas.draw` calls inside one `render`.
+///
+/// ============================================================================
+/// WHY THIS IS AN OUTLINE AND NOT A COLOUR CHANGE
+/// ============================================================================
+///
+/// A player said it plainly: "not sure i like the ghost. it makes it really
+/// hard to see what's you and what's the ghost." No automated check caught that
+/// and none could have — every test in this repository can see where the ghost
+/// IS, and none of them can see what it READS AS.
+///
+/// What it read as was a second car, because it was one. The ghost used to draw
+/// the same `miatasprite.png`, through a `srcIn` colour filter that replaced
+/// every pixel's colour and kept its alpha: the car's exact SILHOUETTE, filled,
+/// in flat teal at 55%. That is already past "a faded copy of the sprite" — and
+/// it was still wrong, which is the useful part of the lesson. The eye
+/// segments a moving scene into masses first and colours them second, so two
+/// filled shapes with the same outline are two of the same thing however
+/// differently they are painted. A different colour rides on top of a shape; it
+/// cannot replace it. There is no colour that makes a car-shaped mass stop
+/// being car-shaped.
+///
+/// So the FILL is what had to go, and with it the sprite. What is drawn now is
+/// a hollow stroke around the rectangle the recorded car occupied:
+///
+///   * A stroke has no mass. There is nothing for the eye to pick up as an
+///     object, so it reads as a marking ON the scene rather than a thing IN it
+///     — which is exactly what a ghost is.
+///   * It stays legible where a fill does not. The interior is untouched, so
+///     the pipe or the sky behind it is still visible through the middle, and
+///     the ghost never hides a piece of the course.
+///   * It survives the frames the two cars overlap, which is precisely when
+///     confusion would cost a run. The live car is drawn on top (see the
+///     priorities at the top of this file), so the outline simply frames it —
+///     where two filled car shapes at the same place smear into one object of
+///     no particular colour.
+///   * It needs no sprite. The old ghost drew nothing at all for the first
+///     frames of a session, while `miatasprite.png` was still decoding.
+///
+/// The rectangle is [carFootprint] — the same pixels [_CarLayer] fills — so the
+/// outline sits exactly where the recorded car was, to the pixel, and the race
+/// still means what it meant.
+///
+/// WHAT WAS DELIBERATELY NOT CHANGED: the live car. It is a full-colour sprite
+/// with interior detail on top of an empty stroke, so it is already the loudest
+/// thing on the playfield; making it louder as well would be spending contrast
+/// nobody needed spent.
 class _GhostLayer extends Component with HasGameReference<FlappyMiataGame> {
   _GhostLayer() : super(priority: _ghostPriority);
 
-  /// A flat, translucent silhouette rather than a faded copy of the sprite.
+  /// Stroke, never fill. `PaintingStyle.stroke` IS the feature — see the class
+  /// comment — so this line is the one that would have to be edited to undo the
+  /// fix, and `test/ghost_render_test.dart` asserts against exactly that by
+  /// reading the pixels in the middle of the ghost and requiring them to be
+  /// untouched.
   ///
-  /// `BlendMode.srcIn` replaces every pixel's colour with this one and keeps
-  /// its alpha, so the result is the car's exact SHAPE in a single colour. Two
-  /// reasons that is the right choice over simply lowering the opacity:
-  ///
-  ///  - It cannot be confused with the live car at a glance, even when the two
-  ///    overlap, which is exactly when confusion would cost the player a run.
-  ///  - It is unambiguous at any size and on any background. A 45%-opacity
-  ///    photograph of a car over a green pipe is a smear.
-  ///
-  /// The colour is the panel border's teal at half alpha — already in this
-  /// file's palette, and readable against both the sky and the pipes.
+  /// Round joins because the corners are the only place a rectangular stroke
+  /// looks like it was drawn by a program rather than designed.
   static final Paint _ghostPaint = Paint()
-    ..colorFilter =
-        const ColorFilter.mode(Color(palette.ghostSilhouette), BlendMode.srcIn)
-    ..filterQuality = FilterQuality.medium
+    ..color = const Color(palette.ghostOutline)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = ghostStrokeWidth
+    ..strokeJoin = StrokeJoin.round
     ..isAntiAlias = true;
 
   @override
   void render(Canvas canvas) {
-    final ui.Image? image = game.carImage;
+    // Asked in this order on purpose. `ghostEnabled` is the player's setting
+    // and `ghostModel` is whether there is anything to show; a player who has
+    // switched the ghost off must get the same empty screen whether or not the
+    // device happens to hold a run.
+    if (!game.ghostEnabled) return;
     final GameModel? ghost = game.ghostModel;
-    if (image == null || ghost == null) return;
-    _drawCar(canvas, image, ghost.carBox, game.size, _ghostPaint);
+    if (ghost == null) return;
+
+    final Rect footprint = carFootprint(ghost.carBox, game.size);
+
+    // Inset by half the stroke, because a stroke straddles the path it is
+    // drawn on. Without this the outline would hang half its width outside the
+    // rectangle it is describing, and the ghost would claim more of the
+    // playfield than the recorded car ever occupied.
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        footprint.deflate(ghostStrokeWidth / 2),
+        // Proportional to the height rather than a fixed pixel radius, so the
+        // shape is the same on a phone and on a tablet. A third of the height
+        // is round enough to read as a car and far from round enough to read
+        // as a bubble.
+        Radius.circular(footprint.height * 0.32),
+      ),
+      _ghostPaint,
+    );
   }
 }
 
