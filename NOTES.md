@@ -722,3 +722,70 @@ hypothesis predicted, and then read a clean log as evidence of nothing wrong.
 Also ruled out by the same log, at no extra cost: `/tmp is ext4`, so the sandbox
 copies were never charged to RAM as a tmpfs; and `drain stalls so far: 0`, so the
 bounded-drain fix was not itself firing.
+
+### It was one mutant, allocating 25 GB
+
+`--jobs=1` failed too, with *higher* memory pressure than `--jobs=2`
+(`full avg10=69.97`). So parallelism was never the cause. The process table at
+death showed nothing large — biggest was the tool itself at 82 MB, under 200 MB
+in total — while `MemAvailable` had fallen from 14.2 GB to 5.7 GB. Something was
+eating the machine and it was not in the table, because the runner cancelled the
+job before the snapshot.
+
+Both failures died with the same mutant in flight: **REL232**, at 42s and 38s.
+Measured locally on a 31 GB machine:
+
+```
+t=  8s   dart+tester RSS = 20851 MB   system free =    5 MB
+t= 56s   dart+tester RSS = 25664 MB   system free =  416 MB
+peak                       25664 MB
+```
+
+`REL232` is `'>=' -> '<'` at `run_code.dart:317`, inverting a decode loop's
+bound so it allocates without limit. **25 GB from one mutant.** This box has the
+RAM to thrash through it and reach the 180s timeout; a 16 GB runner does not,
+and dies in about 40 seconds. `--jobs=1` made it *worse* because with one worker
+REL232 starts sooner.
+
+**The gap: the tool had a time limit and no memory limit.** Turning a bounded
+loop into an unbounded allocation is an ordinary thing for a mutation tester to
+produce. It has to survive one.
+
+**Fixed with a per-mutant memory ceiling**, `--max-rss`, default 4096 MB,
+measured over the whole process tree because the runaway lives in the
+`flutter_tester` grandchild. Chosen against data, not taste:
+
+```
+ordinary mutant, tier 1        1229, 1253 MB
+ordinary mutant, tier 2        1769, 1810 MB
+ceiling                        4096 MB          2.3x the worst honest case
+REL232 unbounded               >25000 MB
+```
+
+Result: REL232 now dies in **5.3s** instead of 180s, caught at 11223 MB.
+Every other verdict in the `--quick` subset is byte-identical to before —
+diffing the verdict lines shows exactly one changed line, REL232 moving from
+`KILLED(t/o)` to `KILLED(mem)`. A memory kill counts as a kill but is reported
+separately and labelled weak evidence, in the same terms as a timeout: it says
+"did not fit", not "asserted wrong".
+
+Every run now prints its own margin — `the hungriest mutant that was NOT
+memory-killed peaked at 1402 MB, leaving 2694 MB of headroom` — so the ceiling
+is re-measured continuously rather than justified once in a comment and left to
+rot.
+
+`--selftest` gained a fourth control: healthy source under a forced 1 MB ceiling
+must return `KILLED(mem)`, while the existing three run at the real ceiling and
+none may be memory-killed. The guard is two-sided by construction.
+
+**An adaptive sampler was written, measured, and deleted.** It sampled 8x faster
+above half the ceiling; against REL232 it never once engaged, because the tree
+goes from under 2 GB to over 13 GB inside a single interval. Unobserved code
+with an unmeasured cost.
+
+**Known limit.** Every overshoot figure above is a Windows number, inflated by a
+2-second sampling gap (one CIM query costs 266 ms). Linux samples every 250 ms
+via `ps`, so the same runaway should be caught nearer 5 GB. That is a design
+expectation and the runner is the first place it is ever tested. If the POSIX
+path is broken the failure is loud: the header says the ceiling cannot be
+enforced and `--selftest` exits 1.

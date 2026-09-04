@@ -10,19 +10,27 @@
 ///     dart run tool\mutate.dart              # every mutant
 ///     dart run tool\mutate.dart --quick      # the CI subset (see quickSubset)
 ///     dart run tool\mutate.dart --list       # generate, print, run nothing
-///     dart run tool\mutate.dart --selftest   # prove the tool can say all three
+///     dart run tool\mutate.dart --selftest   # prove the tool can say each one
 ///     dart run tool\mutate.dart --only=R017,C044
+///     dart run tool\mutate.dart --max-rss=4096   # memory ceiling, MB; 0 = off
 ///
 /// WHY THIS FILE IS PURE DART AND MUTATES ONLY `lib/game/`: the rules live in
 /// two files with no renderer, no clock and no randomness, so a mutant's effect
 /// is a deterministic function of the source. That is what makes "the suite did
 /// not notice" a fact rather than a flake.
 ///
-/// THE THREE VERDICTS, AND WHY THERE ARE THREE AND NOT TWO:
+/// THE VERDICTS, AND WHY THERE ARE MORE THAN TWO:
 ///
-///   KILLED   — at least one test failed. The suite noticed. Good.
-///   SURVIVED — every test passed with broken code. The suite did not notice.
-///   INVALID  — the mutant did not COMPILE, so no test ever ran against it.
+///   KILLED      — at least one test failed. The suite noticed. Good.
+///   SURVIVED    — every test passed with broken code. The suite did not
+///                 notice.
+///   INVALID     — the mutant did not COMPILE, so no test ever ran against it.
+///   KILLED(t/o) — the run did not FINISH inside the timeout.
+///   KILLED(mem) — the run did not FIT inside the `--max-rss` ceiling.
+///
+/// The last two are counted as kills and reported separately, because "it hung"
+/// and "it ate the machine" are detections rather than accusations: no test
+/// asserted that anything was wrong. See [Verdict] and [defaultMaxRssMb].
 ///
 /// The third one is the whole reason this tool can be trusted. Swapping `<` for
 /// `<=` on two enums, or `*` for `/` where the operands are not numbers, is not
@@ -156,6 +164,105 @@ const List<String> sandboxDirs = <String>['lib', 'test', 'tool', 'assets'];
 /// roughly a 4x margin: comfortably clear of normal variation, tight enough
 /// that a genuine infinite loop does not stall the run for a minute.
 const Duration defaultTimeout = Duration(seconds: 45);
+
+/// Default `--max-rss=<MB>`: how much resident memory the process tree behind
+/// ONE mutant may hold before the tool kills it. `--max-rss=0` turns the
+/// ceiling off (and turns the sampler off with it).
+///
+/// WHY A MUTATION TESTER NEEDS THIS AT ALL, which is the part worth reading.
+/// The whole job of this tool is to take working code and break it in small
+/// ways. Some of those breaks turn a bounded loop into an unbounded one, and an
+/// unbounded loop that appends to a list is an unbounded ALLOCATION. That is
+/// not a bug in the mutant and it is not a bug in the generator — it is an
+/// ordinary, expected, correct product of mutating a loop bound, and a mutation
+/// tester that cannot survive one is not finished. `REL232`
+/// (`lib/game/run_code.dart:317`, `'>=' -> '<'`) inverts the varint writer's
+/// bound so `_writeVarint` never terminates; measured on the development
+/// machine it reached 20851 MB eight seconds in and 25664 MB at 56 seconds, and
+/// only stopped because the 180-second TIMEOUT eventually fired. A time limit
+/// is the wrong instrument for that: the mutant is not slow, it is enormous,
+/// and on a 16 GB CI runner the machine dies about 40 seconds before the clock
+/// runs out. Two CI jobs were killed with SIGTERM exactly that way, with this
+/// mutant in flight both times.
+///
+/// WHY 4096 MB AND NOT SOME OTHER NUMBER. The ceiling has to sit in the gap
+/// between what an honest mutant needs and what the runner can afford, and both
+/// ends of that gap are measured rather than guessed. Every figure below is the
+/// peak of the WHOLE `flutter test` process tree, sampled at 250 ms on the
+/// development machine:
+///
+///   ordinary mutant, tier 1 (what all of them run)   1229 and 1253 MB
+///   ordinary mutant, tier 2 (the whole suite, which
+///     only a tier-1 survivor ever escalates to)      1769 and 1810 MB
+///   ---- this ceiling ----                                   4096 MB
+///   REL232, left alone                                     >25000 MB
+///
+/// So the ceiling is 3.3x the memory an ordinary mutant actually uses, and
+/// 2.3x the worst case any honest mutant can reach — far enough above both
+/// that a cold compile, a slower runner or a heavier future test suite cannot
+/// get there by being merely unlucky, which matters because a ceiling that
+/// fires on healthy runs converts honest verdicts into memory kills and
+/// destroys the meaning of the gate. Meanwhile it is about a sixth of REL232's
+/// appetite, and REL232 crosses it inside the first few seconds.
+///
+/// AND WHY NOT HIGHER, since the margin above is the safe direction to err in.
+/// The runner has 16 GB. A ceiling is not a hard bound — see
+/// [rssSampleInterval] for the overshoot arithmetic — so the figure that has to
+/// fit inside the machine is roughly 4096 MB plus whatever the tree adds
+/// between two samples, observed at about 2.5 GB. That lands near 6.5 GB, which
+/// leaves better than half the runner free at `--jobs=1`. Doubling the ceiling
+/// would halve that headroom to buy margin the measurements above say is
+/// already there.
+///
+/// THIS IS A PER-MUTANT CEILING: `--jobs=N` permits N trees to hold it at once.
+const int defaultMaxRssMb = 4096;
+
+/// How often the process tree behind one `flutter test` invocation is weighed.
+///
+/// A SAMPLED CEILING IS NOT A HARD CEILING, and pretending otherwise would be
+/// the dishonest thing to do here. Between two samples the tree can grow as
+/// much as it likes, so what this actually bounds is
+///
+///     worst peak  ~=  ceiling  +  (allocation rate x sample interval)
+///
+/// and the sample interval is the only half of that this tool controls. It is
+/// not a theoretical concern: the first version of this sampler ran at a flat
+/// 2s and caught REL232 at **10250 MB**, then **11360 MB**, against a 4096 MB
+/// ceiling — the right verdict both times, with seven gigabytes of overshoot,
+/// which on a 16 GB runner is the number that decides whether the machine
+/// survives. This one number is the only lever there is on that; an adaptive
+/// scheme that sampled faster near the ceiling was written, measured, and
+/// deleted for never once engaging (see the sampler in [runTests]).
+///
+/// WHY THE TWO PLATFORMS GET DIFFERENT NUMBERS, and why this is not a fudge.
+/// One sample on POSIX is a single `ps`: a few milliseconds, so 250 ms costs
+/// around 3% of one core and holds the overshoot near 1 GB. One sample on
+/// Windows is a PowerShell CIM query, measured at 266 ms on the development
+/// machine, so 250 ms there would be a sampler running flat out for the whole
+/// run. Linux is where this has to survive a 16 GB runner and Windows is where
+/// it is driven by hand on a 31 GB desktop, so each gets the rate that matches
+/// what it is protecting.
+///
+/// THE COST OF THE WINDOWS FIGURE, STATED PLAINLY, because it is the number a
+/// reader will see when they run this themselves. At 2 s, REL232 was caught at
+/// 13371 MB — it went from under 2 GB to over 13 GB inside a single interval,
+/// so the tightening below never got a turn. That overshoot is survivable on
+/// the machine Windows runs this on and would NOT be survivable on the runner,
+/// which is exactly why the POSIX interval is eight times finer. A tier-1 run
+/// also only gets two or three samples on Windows, so the "hungriest ordinary
+/// mutant" line in the report is a LOWER bound there; on Linux the same run is
+/// sampled fifteen times. Neither figure decides a verdict.
+Duration get rssSampleInterval =>
+    Platform.isWindows ? const Duration(seconds: 2) : const Duration(milliseconds: 250);
+
+/// `2s` or `500ms`, for the lines that print the interval. Whole seconds would
+/// render the POSIX interval as `0s`, which reads like the sampler is off.
+String get _sampleIntervalLabel {
+  final Duration d = rssSampleInterval;
+  return d.inMilliseconds % 1000 == 0
+      ? '${d.inSeconds}s'
+      : '${d.inMilliseconds}ms';
+}
 
 /// How long the output drains get AFTER the child process has already exited.
 ///
@@ -484,6 +591,16 @@ enum Verdict {
   /// reported separately, because "hung" is weaker evidence than "failed".
   killedByTimeout,
 
+  /// The process tree behind the run passed the `--max-rss` ceiling and was
+  /// killed. Counted as a kill and reported separately, for exactly the same
+  /// reason as [killedByTimeout] and with exactly the same force: a mutant that
+  /// eats the machine has unquestionably been DETECTED, but "it grew without
+  /// bound" is a statement about resources, not a statement about behaviour.
+  /// No test asserted anything was wrong here — the suite may never have
+  /// reached the changed line at all. Softer evidence than a failing
+  /// assertion, so a reader gets to see how many of the kills rest on it.
+  killedByMemory,
+
   /// Every test passed against broken code. A hole in the suite.
   survived,
 
@@ -496,11 +613,17 @@ enum Verdict {
 
 class MutantResult {
   MutantResult(this.mutant, this.verdict, this.elapsed, this.detail,
-      {this.drainStalled = false});
+      {this.drainStalled = false, this.peakTreeRssMb = 0});
 
   final Mutant mutant;
   final Verdict verdict;
   final Duration elapsed;
+
+  /// Largest process-tree RSS seen while judging this mutant, in MB, or 0 when
+  /// nothing was sampled. Reported so the distance between an ordinary mutant
+  /// and the ceiling is a measured number on every run rather than a claim
+  /// made once in a comment.
+  final int peakTreeRssMb;
 
   /// First useful line of compiler or test output, for the invalid list.
   final String detail;
@@ -1255,6 +1378,198 @@ List<int> _lineStarts(String src) {
 /// here: a timeout fired, or a drain stalled, or the process is being torn down
 /// by a signal. A cleanup path that throws in that moment replaces a
 /// diagnosable problem with an undiagnosable one.
+/// One row per process on this machine: who its parent is, and — when it was
+/// asked for — how much resident memory it is holding.
+///
+/// WHY THIS IS A TYPE RATHER THAN TWO SEPARATE READS. Killing a tree and
+/// weighing a tree need the same fact (the parent/child relation) from the same
+/// listing. Reading it twice, in two places, is how the two copies drift: the
+/// killer walks one shape of the tree and the sampler walks another, and the
+/// only symptom is a ceiling that quietly measures the wrong processes.
+class _ProcTable {
+  _ProcTable(this.parentOf, this.rssKb);
+
+  /// child pid -> parent pid, for every process this listing could see.
+  final Map<int, int> parentOf;
+
+  /// pid -> resident set size in kB. Empty when the table was read without it.
+  final Map<int, int> rssKb;
+
+  /// parent -> children, which is the direction a tree walk needs.
+  Map<int, List<int>> childrenOf() {
+    final Map<int, List<int>> out = <int, List<int>>{};
+    parentOf.forEach((int child, int parent) {
+      (out[parent] ??= <int>[]).add(child);
+    });
+    return out;
+  }
+}
+
+/// Reads this machine's process table, or returns null if it cannot be read.
+/// **Never throws.**
+///
+/// WHY THE PLATFORMS DIFFER, AND WHAT EACH NUMBER ACTUALLY IS. On POSIX `ps`
+/// reports `rss` in kB, which is the resident set: pages actually in physical
+/// memory. On Windows there is no `ps`, and the parent/child relation is not
+/// exposed anywhere a plain Dart program can read, so this asks Win32 through
+/// PowerShell; `WorkingSetSize` is Windows' name for the same idea, in bytes.
+/// They are not identical accounting, but both answer the only question this
+/// tool asks of them — "is this tree eating the machine" — and the ceiling sits
+/// far enough above ordinary use that the difference between the two
+/// definitions cannot decide a verdict.
+///
+/// THE ONE WAY THIS CAN OVER-COUNT, written down because it is the direction
+/// that produces a FALSE memory kill. A parent pid is only meaningful while the
+/// parent is alive. Windows does not clear the field when a parent exits, so a
+/// recycled pid can make an unrelated process look like a descendant of ours;
+/// POSIX reparents orphans to init instead, which moves them out of the tree
+/// rather than into it. The exposure is therefore Windows-only and small, and
+/// the margin between an ordinary tree (~1.3 GB) and the ceiling (4 GB) is far
+/// larger than any process that could wander in this way. The report prints the
+/// largest tree it weighed on every run, so a systematic version of this would
+/// show up as a peak that does not match the work being done.
+_ProcTable? _readProcTable({required bool withRss}) {
+  final Map<int, int> parentOf = <int, int>{};
+  final Map<int, int> rssKb = <int, int>{};
+  try {
+    if (Platform.isWindows) {
+      // One query, three fields. Raw string so PowerShell's `$_` survives Dart
+      // string interpolation untouched.
+      final ProcessResult r = Process.runSync('powershell', <String>[
+        '-NoProfile',
+        '-Command',
+        r"Get-CimInstance Win32_Process | ForEach-Object { '{0} {1} {2}' -f "
+            r'$_.ProcessId, $_.ParentProcessId, $_.WorkingSetSize }',
+      ]);
+      for (final String line in const LineSplitter().convert('${r.stdout}')) {
+        final List<String> f = line.trim().split(RegExp(r'\s+'));
+        if (f.length < 3) {
+          continue;
+        }
+        final int? p = int.tryParse(f[0]);
+        final int? pp = int.tryParse(f[1]);
+        final int? bytes = int.tryParse(f[2]);
+        if (p == null) {
+          continue;
+        }
+        if (pp != null) {
+          parentOf[p] = pp;
+        }
+        if (withRss && bytes != null) {
+          rssKb[p] = bytes ~/ 1024;
+        }
+      }
+    } else {
+      // `ps -eo pid=,ppid=[,rss=]` is the portable listing: `pgrep -P` is not
+      // present everywhere and /proc is Linux-only.
+      final ProcessResult r = Process.runSync(
+        'ps',
+        <String>['-eo', withRss ? 'pid=,ppid=,rss=' : 'pid=,ppid='],
+      );
+      for (final String line in const LineSplitter().convert('${r.stdout}')) {
+        final List<String> f = line
+            .trim()
+            .split(RegExp(r'\s+'))
+            .where((String s) => s.isNotEmpty)
+            .toList();
+        if (f.length < 2) {
+          continue;
+        }
+        final int? p = int.tryParse(f[0]);
+        final int? pp = int.tryParse(f[1]);
+        if (p == null || pp == null) {
+          continue;
+        }
+        parentOf[p] = pp;
+        if (withRss && f.length >= 3) {
+          final int? kb = int.tryParse(f[2]);
+          if (kb != null) {
+            rssKb[p] = kb;
+          }
+        }
+      }
+    }
+  } catch (_) {
+    // No `ps`, no PowerShell, or the query failed. Callers must cope with a
+    // null rather than receive a table that is silently half-populated.
+    return null;
+  }
+  return parentOf.isEmpty ? null : _ProcTable(parentOf, rssKb);
+}
+
+/// [root] and every process descended from it, shallowest level FIRST.
+///
+/// WHY THE LEVELS ARE KEPT RATHER THAN FLATTENED. The killer has to signal
+/// deepest-first — killing a parent before its children is precisely how an
+/// orphan is made, and an orphan gets reparented to init, at which point this
+/// walk can no longer find it from the pid it started with. The sampler does
+/// not care about order and simply sums everything. One walk, two readings.
+///
+/// The pid ceiling is a cycle guard. A process tree is a tree, but this map is
+/// assembled from text produced by another program and does not get to hang the
+/// run if it is malformed.
+List<List<int>> _treeLevels(int root, Map<int, List<int>> childrenOf) {
+  final List<List<int>> levels = <List<int>>[
+    <int>[root],
+  ];
+  final Set<int> seen = <int>{root};
+  while (levels.length < 64) {
+    final List<int> next = <int>[];
+    for (final int p in levels.last) {
+      for (final int c in childrenOf[p] ?? const <int>[]) {
+        if (seen.add(c)) {
+          next.add(c);
+        }
+      }
+    }
+    if (next.isEmpty) {
+      break;
+    }
+    levels.add(next);
+  }
+  return levels;
+}
+
+/// Total resident memory of the process tree rooted at [rootPid], in whole MB,
+/// or null when this platform cannot be asked or the tree has already gone.
+/// **Never throws.**
+///
+/// WHY THE TREE AND NOT THE CHILD, which is the whole reason this function is
+/// more than one line. `flutter test` is not one process: it is a launcher
+/// script, which runs a `flutter_tools` Dart VM, which spawns `flutter_tester`.
+/// The mutant's code executes in the GRANDCHILD. The direct child's own
+/// resident size barely moves while `flutter_tester` eats the machine, so a
+/// ceiling that weighed only the child would sit at a flat few hundred
+/// megabytes through the entire event it exists to catch — a guard that cannot
+/// fire, which is worse than no guard, because it is believed.
+///
+/// PUBLIC ON PURPOSE, like [sha256Hex]. This is the measurement the whole
+/// ceiling rests on, and a measurement nobody can point at a known quantity is
+/// a measurement nobody can check. Being able to call it from a one-off script
+/// against a pid whose size Task Manager or `ps` will also tell you is what
+/// turns "the sampler works" from an assumption into an observation.
+int? treeRssMb(int rootPid) {
+  final _ProcTable? table = _readProcTable(withRss: true);
+  if (table == null || table.rssKb.isEmpty) {
+    return null;
+  }
+  int kb = 0;
+  bool sawAny = false;
+  for (final List<int> level in _treeLevels(rootPid, table.childrenOf())) {
+    for (final int p in level) {
+      final int? own = table.rssKb[p];
+      if (own != null) {
+        kb += own;
+        sawAny = true;
+      }
+    }
+  }
+  // Not "0 MB". A tree that could not be found at all is an absence of
+  // evidence, and reporting it as zero would be a measurement of nothing
+  // wearing the shape of a reassuring number.
+  return sawAny ? kb ~/ 1024 : null;
+}
+
 int _killTree(int pid) {
   if (Platform.isWindows) {
     // `/T` walks the child list itself. This is the only reliable way to do it
@@ -1275,78 +1590,38 @@ int _killTree(int pid) {
     }
   }
 
-  // POSIX. `ps -eo pid=,ppid=` is the portable way to get the parent map:
-  // `pgrep -P` is not present everywhere, and /proc is Linux-only.
-  try {
-    final ProcessResult r = Process.runSync('ps', <String>['-eo', 'pid=,ppid=']);
-    final Map<int, List<int>> children = <int, List<int>>{};
-    for (final String line in const LineSplitter().convert('${r.stdout}')) {
-      final List<String> parts = line
-          .trim()
-          .split(RegExp(r'\s+'))
-          .where((String s) => s.isNotEmpty)
-          .toList();
-      if (parts.length < 2) {
-        continue;
-      }
-      final int? child = int.tryParse(parts[0]);
-      final int? parent = int.tryParse(parts[1]);
-      if (child == null || parent == null) {
-        continue;
-      }
-      (children[parent] ??= <int>[]).add(child);
-    }
-
-    // Breadth-first by level, so the kill can go DEEPEST-FIRST. Order is not
-    // cosmetic here: killing a parent before its children is precisely how an
-    // orphan is made, and an orphan gets reparented to init, at which point
-    // this walk can no longer find it from the pid it started with.
-    final List<List<int>> levels = <List<int>>[
-      <int>[pid],
-    ];
-    final Set<int> seen = <int>{pid};
-    while (true) {
-      final List<int> next = <int>[];
-      for (final int p in levels.last) {
-        for (final int c in children[p] ?? const <int>[]) {
-          if (seen.add(c)) {
-            next.add(c);
-          }
-        }
-      }
-      if (next.isEmpty) {
-        break;
-      }
-      levels.add(next);
-    }
-
-    int signalled = 0;
-    for (int i = levels.length - 1; i >= 0; i--) {
-      for (final int p in levels[i]) {
-        try {
-          // Verified on this machine: killPid returns false for a pid that no
-          // longer exists rather than throwing, so an already-dead descendant
-          // is a no-op and not an error.
-          if (Process.killPid(p, ProcessSignal.sigkill)) {
-            signalled++;
-          }
-        } catch (_) {
-          // Permission denied, or it exited between the listing and the
-          // signal. Both are ordinary; neither is this function's problem.
-        }
-      }
-    }
-    return signalled;
-  } catch (_) {
-    // No usable `ps` — verified: on Windows this throws ProcessException, and
-    // a stripped container image can be missing it too. Falling back to the
-    // single process is still strictly better than doing nothing.
+  // POSIX. The listing and the walk are shared with the memory sampler — see
+  // [_readProcTable] for why they must not be two separate copies.
+  final _ProcTable? table = _readProcTable(withRss: false);
+  if (table == null) {
+    // No usable `ps` — a stripped container image can be missing it. Falling
+    // back to the single process is still strictly better than doing nothing.
     try {
       return Process.killPid(pid, ProcessSignal.sigkill) ? 1 : 0;
     } catch (_) {
       return 0;
     }
   }
+
+  // Deepest level FIRST, which is why [_treeLevels] keeps the levels apart.
+  final List<List<int>> levels = _treeLevels(pid, table.childrenOf());
+  int signalled = 0;
+  for (int i = levels.length - 1; i >= 0; i--) {
+    for (final int p in levels[i]) {
+      try {
+        // Verified on this machine: killPid returns false for a pid that no
+        // longer exists rather than throwing, so an already-dead descendant
+        // is a no-op and not an error.
+        if (Process.killPid(p, ProcessSignal.sigkill)) {
+          signalled++;
+        }
+      } catch (_) {
+        // Permission denied, or it exited between the listing and the
+        // signal. Both are ordinary; neither is this function's problem.
+      }
+    }
+  }
+  return signalled;
 }
 
 /// What one worker is judging right now, and when it started.
@@ -1578,6 +1853,41 @@ void _printMachineLine() {
       b.write(', ${Directory.systemTemp.path} is ${fs ?? 'an unknown fs'}');
     }
     stdout.writeln(b.toString());
+  } catch (_) {
+    // Diagnostics are never allowed to be the reason a run fails.
+  }
+}
+
+/// States, at the top of every run, whether the memory ceiling can actually
+/// weigh anything on this machine — and proves it by printing a number.
+///
+/// WHY A GUARD HAS TO SAY THIS OUT LOUD. `--max-rss` is enforced by reading the
+/// machine's process table, which needs `ps` on POSIX or PowerShell on Windows.
+/// A stripped container image can have neither. In that case the sampler reads
+/// null forever and the ceiling silently never fires — a check that cannot fail,
+/// which is strictly worse than no check, because the run still prints a
+/// ceiling in its header and a reader has every reason to believe it. So the
+/// probe runs against this tool's OWN process tree, where the answer is known
+/// to be non-zero, and the observed figure is printed. A number is a claim that
+/// can be wrong; "enabled" is not.
+void _printMemoryProbe(int maxRssMb) {
+  try {
+    if (maxRssMb <= 0) {
+      stdout.writeln('memory ceiling: OFF (--max-rss=0). A mutant that '
+          'allocates without bound will run until the timeout, or until the '
+          'machine gives out — whichever comes first.');
+      return;
+    }
+    final int? own = treeRssMb(pid);
+    stdout.writeln(own == null
+        ? 'memory ceiling: CANNOT BE ENFORCED on this machine — the process '
+            'table could not be read (no `ps` on POSIX, no PowerShell on '
+            'Windows), so the sampler has nothing to weigh and the '
+            '$maxRssMb MB ceiling will never fire. --selftest fails on this '
+            'machine for the same reason, deliberately.'
+        : 'memory ceiling: enforced at $maxRssMb MB per mutant, sampled every '
+            '$_sampleIntervalLabel (probe: this tool\'s own process '
+            'tree weighs $own MB right now, so the measurement works)');
   } catch (_) {
     // Diagnostics are never allowed to be the reason a run fails.
   }
@@ -1909,11 +2219,16 @@ Set<int> _pidsReferencingSandboxes() {
 // =============================================================================
 
 class TestRun {
-  TestRun(this.verdict, this.detail, this.elapsed, {this.drainStalled = false});
+  TestRun(this.verdict, this.detail, this.elapsed,
+      {this.drainStalled = false, this.peakTreeRssMb = 0});
 
   final Verdict verdict;
   final String detail;
   final Duration elapsed;
+
+  /// Largest process-tree RSS sampled during this run, in MB; 0 if the sampler
+  /// was off or could not read the machine.
+  final int peakTreeRssMb;
 
   /// True if the output drains were still open [drainGrace] after the child
   /// exited, i.e. this run's output may be TRUNCATED. Carried through to the
@@ -1934,6 +2249,7 @@ Future<TestRun> runTests(
   String repoRoot,
   List<String> testPaths,
   Duration timeout,
+  int maxRssMb,
 ) async {
   final Stopwatch sw = Stopwatch()..start();
   final Process proc = await Process.start(
@@ -1948,6 +2264,73 @@ Future<TestRun> runTests(
       proc.stdout.transform(utf8.decoder).forEach(buf.write);
   final Future<void> errDone =
       proc.stderr.transform(utf8.decoder).forEach(buf.write);
+
+  // ---- the memory ceiling ------------------------------------------------
+  //
+  // WHY THIS IS A SEPARATE CLOCK FROM THE TIMEOUT, and not a smarter timeout.
+  // The two watch different failures. A timeout catches a mutant that does not
+  // FINISH; this catches a mutant that does not FIT. REL232 was never slow — it
+  // allocated 20 GB in eight seconds and would have finished the job long
+  // before the 180-second timeout, except that on a 16 GB runner there is no
+  // machine left by then. A ceiling expressed in seconds cannot see that, and
+  // lowering it until it could would start converting slow-but-honest runs into
+  // timeout-kills, which is the weakest verdict this tool produces.
+  //
+  // The sampler only ever KILLS and RECORDS. It cannot turn a failing test into
+  // a passing one, and it cannot manufacture a survivor: every path out of here
+  // that it touches is a kill.
+  int peakTreeRssMb = 0;
+  bool overMemory = false;
+  int killedAtMb = 0;
+  Timer? sampler;
+  if (maxRssMb > 0) {
+    // A FLAT SAMPLE RATE, DELIBERATELY, and this is worth recording because the
+    // obvious improvement was tried and thrown away.
+    //
+    // The version before this one sampled slowly and then TIGHTENED to an
+    // eighth of the interval once the tree passed half the ceiling, on the
+    // theory that the fast rate should be spent only where it buys something.
+    // It was measured twice against REL232 and the tightening never once got a
+    // turn: the tree went from under 2 GB to over 13 GB inside a single
+    // interval, so the first sample that saw it over half the ceiling was the
+    // same sample that saw it over the ceiling. It bought nothing — and it
+    // carried a real cost nobody had measured, because an honest mutant on a
+    // colder, slower runner than the one these numbers came from could sit
+    // above half the ceiling for its whole run and be sampled thirty times a
+    // second for the privilege. An optimisation that has never been observed
+    // working, on the platform it was written for, is not an optimisation.
+    //
+    // What is left is one number, [rssSampleInterval], which is the only real
+    // lever on how far past the ceiling a runaway gets before anybody looks.
+    sampler = Timer.periodic(rssSampleInterval, (Timer t) {
+      final int? mb = treeRssMb(proc.pid);
+      if (mb == null) {
+        // The tree has gone, or this machine cannot be weighed. Either way
+        // there is nothing to compare against a ceiling. The run-start probe
+        // in `_run` is what tells a reader which of the two it is.
+        return;
+      }
+      if (mb > peakTreeRssMb) {
+        peakTreeRssMb = mb;
+      }
+      if (mb < maxRssMb || overMemory) {
+        return;
+      }
+      overMemory = true;
+      killedAtMb = mb;
+      t.cancel();
+      // The whole tree, for the reason spelled out on [treeRssMb]: the memory
+      // is in the grandchild, so killing the direct child would leave the thing
+      // we are trying to stop still running and still growing.
+      final int reaped = _killTree(proc.pid);
+      _emit(
+        'MEMORY CEILING: process tree reached $mb MB at '
+        '${sw.elapsed.inSeconds}s, over the $maxRssMb MB ceiling — killed '
+        '$reaped pid(s). This is a KILL, and a weak one: nothing asserted the '
+        'behaviour was wrong, only that it would not fit.',
+      );
+    });
+  }
 
   int? exitCode;
   bool timedOut = false;
@@ -2016,10 +2399,30 @@ Future<TestRun> runTests(
         'timed-out process tree ($reaped pid(s) signalled).',
       );
     }
+  } finally {
+    // Unconditional, on every path out including an exception. A live periodic
+    // timer keeps the Dart VM resident after the useful work is done, which is
+    // a failure this tool has already been bitten by once.
+    sampler?.cancel();
   }
   sw.stop();
 
   final String output = buf.toString();
+
+  // Memory is checked FIRST, ahead of the timeout and well ahead of the exit
+  // code. The tree was killed, so the process exits non-zero and the classifier
+  // below would happily read that as an ordinary KILLED — a strictly stronger
+  // verdict than the evidence supports, filed under a cause that never
+  // happened. The tool knows exactly why this process died; it should say so.
+  if (overMemory) {
+    return TestRun(
+      Verdict.killedByMemory,
+      'process tree reached $killedAtMb MB, over the $maxRssMb MB ceiling',
+      sw.elapsed,
+      drainStalled: drainStalled,
+      peakTreeRssMb: peakTreeRssMb,
+    );
+  }
 
   if (timedOut) {
     return TestRun(
@@ -2027,6 +2430,7 @@ Future<TestRun> runTests(
       'no result within ${timeout.inSeconds}s',
       sw.elapsed,
       drainStalled: drainStalled,
+      peakTreeRssMb: peakTreeRssMb,
     );
   }
 
@@ -2035,17 +2439,17 @@ Future<TestRun> runTests(
       output.contains('Error: The Dart compiler exited unexpectedly') ||
       (output.contains('Failed to load "') && output.contains(': Error: '))) {
     return TestRun(Verdict.invalid, _firstCompilerError(output), sw.elapsed,
-        drainStalled: drainStalled);
+        drainStalled: drainStalled, peakTreeRssMb: peakTreeRssMb);
   }
 
   if (exitCode == 0 && output.contains('All tests passed!')) {
     return TestRun(Verdict.survived, '', sw.elapsed,
-        drainStalled: drainStalled);
+        drainStalled: drainStalled, peakTreeRssMb: peakTreeRssMb);
   }
 
   if (output.contains('Some tests failed.') || (exitCode ?? 1) != 0) {
     return TestRun(Verdict.killed, _firstFailure(output), sw.elapsed,
-        drainStalled: drainStalled);
+        drainStalled: drainStalled, peakTreeRssMb: peakTreeRssMb);
   }
 
   // Neither shape. Refusing to guess is the point: an unrecognised outcome
@@ -2059,6 +2463,7 @@ Future<TestRun> runTests(
         : 'UNRECOGNISED test output (exit $exitCode)',
     sw.elapsed,
     drainStalled: drainStalled,
+    peakTreeRssMb: peakTreeRssMb,
   );
 }
 
@@ -2236,6 +2641,7 @@ Future<int> _run(List<String> args) async {
   final Set<String>? only = opts['only']?.split(',').toSet();
   final int heartbeatSeconds =
       int.parse(opts['heartbeat'] ?? '$defaultHeartbeatSeconds');
+  final int maxRssMb = int.parse(opts['max-rss'] ?? '$defaultMaxRssMb');
 
   // ---- read the originals, once, as bytes --------------------------------
   final Map<String, Uint8List> originalBytes = <String, Uint8List>{};
@@ -2370,8 +2776,9 @@ Future<int> _run(List<String> args) async {
       }
     }
 
-    _printHeader(all, quick, timeout, int.parse(opts['jobs'] ?? '1'));
+    _printHeader(all, quick, timeout, int.parse(opts['jobs'] ?? '1'), maxRssMb);
     _printMachineLine();
+    _printMemoryProbe(maxRssMb);
     stdout.writeln('');
 
     // FLUSH THE HEADER EXPLICITLY, and after every line printed below that a
@@ -2413,15 +2820,18 @@ Future<int> _run(List<String> args) async {
     }
 
     if (selftest) {
-      // Three controls, so the heartbeat's `done N/total` means something
+      // Four controls, so the heartbeat's `done N/total` means something
       // during the self-test too rather than reading `0/0` for its duration.
-      _progress.total = 3;
+      // The fourth is the memory ceiling: it is a guard, and a guard nobody has
+      // watched go red is not known to work.
+      _progress.total = 4;
       final bool ok = await _runSelfTest(
         flutterCmd,
         repoRoot,
         originalText,
         restoreAll,
         timeout,
+        maxRssMb,
       );
       return ok ? 0 : 1;
     }
@@ -2510,6 +2920,7 @@ Future<int> _run(List<String> args) async {
           originalText,
           originalBytes,
           timeout,
+          maxRssMb,
         );
         _progress.finish(label);
         results.add(r);
@@ -2592,6 +3003,7 @@ Future<int> _run(List<String> args) async {
       quick: quick,
       teardownWarnings: teardownWarnings,
       drainStalls: _progress.drainStalls,
+      maxRssMb: maxRssMb,
     );
 
     // THE EXIT CODE REFLECTS THE VERDICTS AND NOTHING ELSE.
@@ -2636,21 +3048,28 @@ Future<MutantResult> _judge(
   Map<String, String> originalText,
   Map<String, Uint8List> originalBytes,
   Duration timeout,
+  int maxRssMb,
 ) async {
   _applyMutant(root, m, originalText[m.file]!);
-  TestRun run = await runTests(flutterCmd, root, tier1Tests, timeout);
+  TestRun run = await runTests(flutterCmd, root, tier1Tests, timeout, maxRssMb);
 
   // Escalation: tier 1 passing is not proof, because tier 1 is a subset of the
   // suite. Re-run everything before calling anything a survivor.
   if (run.verdict == Verdict.survived) {
-    final TestRun full = await runTests(flutterCmd, root, tier2Tests, timeout);
+    final TestRun full =
+        await runTests(flutterCmd, root, tier2Tests, timeout, maxRssMb);
     // A stall in EITHER tier taints the verdict, so the flag is OR-ed rather
-    // than overwritten by the later run.
+    // than overwritten by the later run. The peak is the MAX across both for
+    // the same reason: this mutant's appetite is the largest it ever showed,
+    // not whichever tier happened to run last.
     run = TestRun(
       full.verdict,
       full.detail,
       run.elapsed + full.elapsed,
       drainStalled: run.drainStalled || full.drainStalled,
+      peakTreeRssMb: run.peakTreeRssMb > full.peakTreeRssMb
+          ? run.peakTreeRssMb
+          : full.peakTreeRssMb,
     );
   }
 
@@ -2658,7 +3077,7 @@ Future<MutantResult> _judge(
     _writeWithRetry(File('$root/$rel'), originalBytes[rel]!);
   }
   return MutantResult(m, run.verdict, run.elapsed, run.detail,
-      drainStalled: run.drainStalled);
+      drainStalled: run.drainStalled, peakTreeRssMb: run.peakTreeRssMb);
 }
 
 /// Creates worker sandbox [i]: a minimal copy of the package that `flutter
@@ -2833,6 +3252,7 @@ void sleepMillis(int ms) {
 String _verdictLabel(Verdict v) => switch (v) {
       Verdict.killed => 'KILLED',
       Verdict.killedByTimeout => 'KILLED(t/o)',
+      Verdict.killedByMemory => 'KILLED(mem)',
       Verdict.survived => 'SURVIVED',
       Verdict.invalid => 'INVALID',
       Verdict.equivalent => 'EQUIVALENT',
@@ -2980,7 +3400,7 @@ int _min(int a, int b) => a < b ? a : b;
 // --selftest  (Part 3: prove the tool is capable of every verdict)
 // =============================================================================
 
-/// Three controls, because a tool that can only say one thing says nothing.
+/// Four controls, because a tool that can only say one thing says nothing.
 ///
 /// A mutation harness that reports 100% because its mutants never reached the
 /// disk looks exactly like a perfect test suite. The difference is only visible
@@ -2992,6 +3412,11 @@ int _min(int a, int b) => a < b ? a : b;
 ///              out "always reports killed", and it is the one people leave out.
 ///   INVALID  — a syntactically broken edit must come back INVALID and must NOT
 ///              be counted as a kill.
+///   MEMORY   — healthy source under a 1 MB ceiling must come back
+///              KILLED(mem). The memory ceiling is a guard, and a guard nobody
+///              has watched go red is not known to work; the three controls
+///              above are its negative fixture, because they run at the REAL
+///              ceiling and none of them may be memory-killed.
 ///
 /// THE NEGATIVE CONTROL'S JUDGE, and why it is the file named in
 /// [negativeControlTest] rather than some other one.
@@ -3027,6 +3452,7 @@ Future<bool> _runSelfTest(
   Map<String, String> originalText,
   void Function() restoreAll,
   Duration timeout,
+  int maxRssMb,
 ) async {
   const String file = 'lib/game/game_model.dart';
   const String gravityDecl = 'static const double gravity = 2.2;';
@@ -3052,22 +3478,33 @@ Future<bool> _runSelfTest(
   // `label` is only for the heartbeat and the death report: it is what appears
   // as the in-flight item so a self-test that wedges says WHICH control it
   // wedged on, which is the difference between a bug report and a shrug.
+  // The three source-level controls run under a REAL ceiling, never under no
+  // ceiling. That is what makes them the negative fixture for the fourth
+  // control below: if the memory guard fired on ordinary healthy runs, these
+  // three would come back KILLED(mem) instead of the verdicts they assert, and
+  // the self-test would fail. A run launched with `--max-rss=0` still gets the
+  // default here, because this function is a claim about what the TOOL can do,
+  // not about how this particular invocation was configured.
+  final int controlCeiling = maxRssMb > 0 ? maxRssMb : defaultMaxRssMb;
+
   Future<TestRun> withSource(
     String label,
     String replacement,
-    List<String> tests,
-  ) async {
+    List<String> tests, {
+    int? ceilingMb,
+  }) async {
     _progress.begin('selftest', label);
     File('$repoRoot/$file')
         .writeAsStringSync(src.replaceFirst(gravityDecl, replacement), flush: true);
-    final TestRun r = await runTests(flutterCmd, repoRoot, tests, timeout);
+    final TestRun r = await runTests(
+        flutterCmd, repoRoot, tests, timeout, ceilingMb ?? controlCeiling);
     restoreAll();
     _progress.finish('selftest');
     return r;
   }
 
   _emit('');
-  _emit('=== SELF-TEST: can the tool produce all three verdicts? ===');
+  _emit('=== SELF-TEST: can the tool produce every verdict it claims? ===');
   _emit('');
 
   final TestRun positive =
@@ -3102,14 +3539,51 @@ Future<bool> _runSelfTest(
     _emit('          ${invalid.detail}');
   }
 
+  // MEMORY — the fourth control, and the one that proves the ceiling is not
+  // decoration.
+  //
+  // WHY THE SOURCE IS LEFT UNTOUCHED HERE. `replacement` is the ORIGINAL
+  // declaration, so this control runs the healthy, unmutated model; the only
+  // thing changed is the ceiling, set to 1 MB, which no real `flutter test`
+  // tree has ever fitted inside. That isolates the guard from the code: a
+  // KILLED(mem) here can only mean the sampler read the process tree, the walk
+  // found the descendants, the kill landed and the classifier filed it under
+  // the right verdict. Doing it with a genuinely runaway mutant instead would
+  // prove the same four things while allocating gigabytes and taking minutes,
+  // and would fail for a second, unrelated reason the day that mutant's line
+  // number moves.
+  //
+  // AND THE OTHER HALF, WHICH IS THE HALF PEOPLE LEAVE OUT. A guard that fires
+  // on everything separates nothing. The three controls above are the negative
+  // fixture: they ran the same sampler against the same kind of process tree at
+  // the real ceiling, and every one of them had to come back with a verdict
+  // that is NOT a memory kill for this self-test to pass.
+  final TestRun memory =
+      await withSource('MEMORY', gravityDecl, tier1Tests, ceilingMb: 1);
+  _emit(
+    'MEMORY    healthy source, ceiling forced to 1 MB           '
+    '=> ${_verdictLabel(memory.verdict)} (want KILLED(mem))',
+  );
+  _emit('          the other three ran at the real ceiling '
+      '($controlCeiling MB) and none was memory-killed, which is the '
+      'other half of the claim');
+  if (memory.verdict != Verdict.killedByMemory) {
+    _emit('          ${memory.detail.isEmpty ? '(no detail)' : memory.detail}');
+    _emit('          if this machine cannot read its own process table, the '
+        'ceiling cannot fire here and this control cannot pass — see the '
+        'probe line in the header.');
+  }
+
   final bool ok = positive.verdict == Verdict.killed &&
       negative.verdict == Verdict.survived &&
-      invalid.verdict == Verdict.invalid;
+      invalid.verdict == Verdict.invalid &&
+      memory.verdict == Verdict.killedByMemory;
 
   _emit('');
   _emit(ok
-      ? 'SELF-TEST PASSED — the classifier is capable of all three verdicts, so '
-          'a KILLED is a real observation and not a default.'
+      ? 'SELF-TEST PASSED — the classifier is capable of KILLED, SURVIVED, '
+          'INVALID and KILLED(mem), so each of them is a real observation and '
+          'not a default.'
       : 'SELF-TEST FAILED — do not trust any score this tool prints.');
   await _outIdle();
   return ok;
@@ -3119,7 +3593,8 @@ Future<bool> _runSelfTest(
 // Reporting
 // =============================================================================
 
-void _printHeader(List<Mutant> all, bool quick, Duration timeout, int jobs) {
+void _printHeader(
+    List<Mutant> all, bool quick, Duration timeout, int jobs, int maxRssMb) {
   stdout.writeln('mutate.dart — mutation testing for lib/game/');
   stdout.writeln('');
   stdout.writeln('targets:');
@@ -3137,6 +3612,12 @@ void _printHeader(List<Mutant> all, bool quick, Duration timeout, int jobs) {
   stdout.writeln('tier 1 (every mutant):   flutter test ${tier1Tests.join(' ')}');
   stdout.writeln('tier 2 (survivors only): flutter test        [whole suite]');
   stdout.writeln('timeout: ${timeout.inSeconds}s per run');
+  // Both limits on one screen, because they are two halves of one idea: a run
+  // is abandoned when it will not finish OR when it will not fit.
+  stdout.writeln(maxRssMb > 0
+      ? 'memory:  $maxRssMb MB per mutant process tree (--max-rss), '
+          'sampled every $_sampleIntervalLabel'
+      : 'memory:  no ceiling (--max-rss=0)');
   stdout.writeln(jobs > 1
       ? 'jobs: $jobs sandboxed workers (the repo copy of lib/game is never '
           'written to in this mode)'
@@ -3167,6 +3648,7 @@ void _printReport({
   required bool quick,
   required List<String> teardownWarnings,
   required int drainStalls,
+  required int maxRssMb,
 }) {
   int count(Verdict v) =>
       results.where((MutantResult r) => r.verdict == v).length;
@@ -3174,7 +3656,8 @@ void _printReport({
   final int total = results.length;
   final int invalid = count(Verdict.invalid);
   final int timeouts = count(Verdict.killedByTimeout);
-  final int killed = count(Verdict.killed) + timeouts;
+  final int memKills = count(Verdict.killedByMemory);
+  final int killed = count(Verdict.killed) + timeouts + memKills;
   final int survived = count(Verdict.survived);
   final int equivalent = count(Verdict.equivalent);
 
@@ -3198,6 +3681,11 @@ void _printReport({
   stdout.writeln('  killed                    ${killed.toString().padLeft(5)}');
   stdout.writeln('    of which by timeout     ${timeouts.toString().padLeft(5)}   '
       'weaker evidence: "did not finish", not "asserted wrong"');
+  // Broken out beside the timeout count and worded the same way on purpose.
+  // Both are kills the machine handed us rather than kills a test earned, and a
+  // reader deciding how much the score is worth needs to see both numbers.
+  stdout.writeln('    of which by memory      ${memKills.toString().padLeft(5)}   '
+      'weaker evidence: "did not fit", not "asserted wrong"');
   stdout.writeln('  SURVIVED                  ${survived.toString().padLeft(5)}');
 
   // Printed only when it happened, but never suppressed when it did. A stalled
@@ -3226,6 +3714,52 @@ void _printReport({
   }
   stdout.writeln('');
 
+  // ---- what the memory ceiling actually saw ------------------------------
+  //
+  // THE MARGIN IS PRINTED ON EVERY RUN, and this is the point of the section.
+  // A ceiling justified only by a number somebody measured once is a number
+  // that drifts the moment the test suite grows. Printing the largest tree any
+  // ORDINARY mutant needed, beside the ceiling, makes the margin a live
+  // measurement: if it ever starts creeping towards the ceiling, that is
+  // visible in the report long before it starts converting honest verdicts
+  // into memory kills. Mutants the ceiling killed are excluded from this
+  // figure on purpose — their peak is the ceiling, so including them would
+  // make the margin read as zero and mean nothing.
+  if (maxRssMb > 0) {
+    final List<MutantResult> weighed = results
+        .where((MutantResult r) =>
+            r.verdict != Verdict.killedByMemory && r.peakTreeRssMb > 0)
+        .toList()
+      ..sort((MutantResult a, MutantResult b) =>
+          b.peakTreeRssMb.compareTo(a.peakTreeRssMb));
+    if (weighed.isEmpty) {
+      // Never silently absent, and the reasons it can be empty must not be
+      // printed as the same sentence. "Every mutant here hit the ceiling" is an
+      // ordinary result of a one-mutant `--only=` run. Nothing weighed at all
+      // is different, and it has two causes with very different weight: a run
+      // so short that no sample ever landed on a live tree, which is harmless
+      // because a runaway mutant is never short; or a machine whose process
+      // table cannot be read, which means the ceiling in the header was a
+      // promise this run could not keep. The header's probe line is what
+      // separates them, so this points at it rather than guessing.
+      stdout.writeln(memKills > 0
+          ? 'memory: no ordinary peak to report — every mutant that ran was '
+              'memory-killed, so there is nothing here the ceiling did not '
+              'touch'
+          : 'memory: no process tree was ever successfully weighed — either '
+              'every run finished inside the $_sampleIntervalLabel sample '
+              'interval, or this machine\'s process table cannot be read at '
+              'all. The probe line in the header says which.');
+    } else {
+      final MutantResult worst = weighed.first;
+      stdout.writeln('memory: ceiling $maxRssMb MB; the hungriest mutant that '
+          'was NOT memory-killed peaked at ${worst.peakTreeRssMb} MB '
+          '(${worst.mutant.id}), leaving '
+          '${maxRssMb - worst.peakTreeRssMb} MB of headroom');
+    }
+    stdout.writeln('');
+  }
+
   // ---- per-operator breakdown ------------------------------------------
   stdout.writeln('by operator:');
   stdout.writeln('  op    run  invalid  equiv  killed  survived');
@@ -3236,7 +3770,9 @@ void _printReport({
       continue;
     }
     int c(Verdict v) => fam.where((MutantResult r) => r.verdict == v).length;
-    final int famKilled = c(Verdict.killed) + c(Verdict.killedByTimeout);
+    final int famKilled = c(Verdict.killed) +
+        c(Verdict.killedByTimeout) +
+        c(Verdict.killedByMemory);
     stdout.writeln(
       '  ${op.tag}${fam.length.toString().padLeft(7)}'
       '${c(Verdict.invalid).toString().padLeft(9)}'
@@ -3260,6 +3796,24 @@ void _printReport({
     }
   }
   stdout.writeln('');
+
+  // ---- memory kills ------------------------------------------------------
+  // Listed by id, with the size that triggered them, for the same reason the
+  // invalid list exists: a verdict nobody can look up is a verdict nobody can
+  // argue with. Every entry here is reproducible with `--only=<id>`.
+  final List<MutantResult> memory = results
+      .where((MutantResult r) => r.verdict == Verdict.killedByMemory)
+      .toList();
+  if (memory.isNotEmpty) {
+    stdout.writeln('MEMORY KILLS (${memory.length}) — counted as kills, but on '
+        'weaker evidence than a failing assertion: the suite never got to '
+        'finish judging these, it only established that they will not fit:');
+    for (final MutantResult r in memory) {
+      stdout.writeln('  ${r.mutant.id.padRight(8)}${r.mutant.describe()}');
+      stdout.writeln('      ${r.detail}');
+    }
+    stdout.writeln('');
+  }
 
   // ---- invalid ----------------------------------------------------------
   final List<MutantResult> bad =
