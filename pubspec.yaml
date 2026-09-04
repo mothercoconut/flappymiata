@@ -31,9 +31,19 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # The following adds the Cupertino Icons font to your application.
-  # Use with the CupertinoIcons class for iOS style icons.
-  cupertino_icons: ^1.0.8
+  # WHERE `cupertino_icons` WENT, and why it is not coming back:
+  #
+  # It was the Flutter template's default and this app never used it. It is a
+  # font and nothing else — `CupertinoIcons.ttf`, 258 KB of glyphs — and it was
+  # being copied into every APK because it was listed here, not because
+  # anything drew from it. `grep -rn "cupertino" lib/ test/ tool/ -i` returns
+  # nothing, and `grep -rn "package:flutter/cupertino" .` returns nothing: this
+  # app draws its own buttons out of `Container` and `Text`, so there is no
+  # icon set to be an alternative to.
+  #
+  # It cost 116 KB of the compressed APK. That is a small number on its own and
+  # it is the whole point: it is 116 KB of a font nobody can see, in a build
+  # measured against a size bar.
   flame: ^1.38.2
 
   # The ONE dependency added for high-score persistence, and the reason it is
@@ -68,13 +78,36 @@ dev_dependencies:
 
 # The following section is specific to Flutter packages.
 flutter:
-  uses-material-design: true
+  # OFF, AND THE APP HAS NEVER USED IT.
+  #
+  # `uses-material-design: true` does exactly one thing: it bundles
+  # `MaterialIcons-Regular.otf` as an asset. It is not what makes Material
+  # widgets work and switching it off does not take a widget away — it takes a
+  # FONT away, and that font is only readable through `Icons.*`, which needs
+  # `package:flutter/material.dart`.
+  #
+  # This app imports `package:flutter/widgets.dart` and never Material:
+  # `grep -rn "package:flutter/material" lib/ test/` returns nothing, and
+  # `grep -rn "Icons\.\|IconData\|Icon(" lib/` returns nothing. Every screen in
+  # `lib/ui/game_screens.dart` is built from `Container`, `Text` and
+  # `GestureDetector`, and every glyph on screen is a letter.
+  #
+  # WHY IT WAS COSTING THE FULL 1.6 MB rather than being tree-shaken to
+  # nothing: the icon tree-shaker walks the compiled app for const `IconData`
+  # instances and keeps the code points it finds. With zero `IconData` in the
+  # program there is nothing for it to walk, and the build kept the whole font.
+  # An optimisation that only fires when the feature is used cannot fire on an
+  # app that does not use the feature at all — the fix is to stop asking for
+  # the asset, which is this line.
+  #
+  # It cost 556 KB of the compressed APK, and 1.6 MB of the installed one.
+  #
+  # TURN THIS BACK ON THE MOMENT ANY FILE IMPORTS `package:flutter/material.dart`
+  # AND DRAWS AN `Icon`. Without it that icon renders as an empty box, and it
+  # will do so silently — there is no build error for a missing glyph.
+  uses-material-design: false
   assets:
     - assets/sprites/
-
-  # The following line ensures that the Material Icons font is
-  # included with your application, so that you can use the icons in
-  # the material Icons class.
 
   # To add assets to your application, add an assets section, like this:
   # assets:

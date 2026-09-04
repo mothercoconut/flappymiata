@@ -1071,3 +1071,97 @@ Only a pixel-level test caught it — so one was written: render the tree to rea
 RGBA at two decor phases while the run is `ready`, and require the bytes to
 differ with motion full and be identical with it reduced. Without it, reduced
 motion would have had thorough tests of a clock that nothing drew.
+
+## 2026-09-04 — Phase 6b: size, frame time, the Flame decision, and removals
+
+**Bar 5 closed, but the bar as written was wrong and that is the finding.**
+
+I specified zero jank frames measured from `adb shell dumpsys gfxinfo`.
+**That instrument cannot see this app.** Flutter renders into a `SurfaceView`,
+bypassing the HWUI pipeline gfxinfo reports on. After 70 seconds of continuous
+play it returns `Total frames rendered: 0` and `Janky frames: 0 (0.00%)`.
+
+Its everything-is-perfect output and its I-can-see-nothing output are the same
+string. A run that took the bar literally would have reported a flawless pass
+from an instrument measuring nothing — the exact failure this project keeps
+hunting, written into the acceptance criteria by me.
+
+Measured instead with `SchedulerBinding.addTimingsCallback`. A jank frame is a
+vsync interval in which no new frame was presented, from consecutive
+`vsyncStart` gaps over the 16,667 us budget read off `display.refreshRate`. Not
+`totalSpan` against budget: that is end-to-end latency across a pipelined
+build/raster path and reports 100% failure while the game holds 59.9 fps.
+
+**Zero missed vsyncs, 3 of 3 quiet runs, 3,594 frames over 60s**, driven by the
+solver bot rather than a metronome, restarting on death so the minute is
+continuous play.
+
+```
+              p50    p90    p99    max    >=17ms
+build          0ms    0ms    1ms    2ms    0
+raster        15ms   16ms   18ms   23ms    9.9%
+```
+
+Two runs were discarded for host CPU contention and are shown in
+`docs/performance.md` rather than dropped, because they initially pointed the
+wrong way.
+
+Backdrop optimisation bought tail latency, not throughput: the sky gradient is
+clipped to the horizon (30% was painted then covered) and the hill path cached
+instead of rebuilt twice a frame. Frames at or above 20ms raster went 20 to 2;
+worst 33ms to 20ms.
+
+**APK size.**
+
+```
+split arm64-v8a    15,025,382 bytes  (14.33 MB)   <- claimed against the bar
+split armeabi-v7a  12,221,104
+split x86_64       16,394,469
+universal          42,019,511                     <- cannot reach 30 MB
+```
+
+The universal APK carries three copies of the Flutter engine, 33.4 MB, 79.5% of
+the file, and is not what anyone installs. Reductions: turning off
+`uses-material-design` saved 556 KB — the icon tree-shaker keeps code points
+found in const `IconData`, and with none present it had nothing to walk, so the
+whole font survived — and dropping `cupertino_icons` saved 116 KB. Nothing else
+in the APK is ours.
+
+**Flame stays, and the numbers say so.**
+
+```
+                        with Flame    without
+libapp.so arm64          2,425,736   2,229,128   (-196,608 = 1.31% of the split APK)
+cold start median            640ms       741ms   (7 runs each)
+missed vsyncs / 60s              0           0
+```
+
+It costs 1.3% of an APK clearing the bar with 50% margin, cannot cost frame time
+(everything it does runs on a UI thread finishing 98.5% of frames under 1 ms
+against a 16.667 ms budget), and removing it made cold start worse. The
+replacement is about 190 lines of game loop, layer ordering, text layout and
+overlay management owned forever, for 197 KB — while one line of pubspec saved
+three and a half times more.
+
+**Removals.** `lib/dev/` deleted; no import of it existed anywhere. A stale
+exemption clause in `test/palette_test.dart` naming `lib/dev/` was repointed —
+the dangerous kind, since nothing about an unscanned missing directory ever goes
+red.
+
+Kept, with reasons found by reading the suite rather than grepping: the debug
+overlay, proven absent from the shipped AOT snapshot so it costs zero bytes
+while its three colours are graded pairs under both dichromacy simulations; the
+non-daily-challenge branch, asserted by `widget_test`; and the `chaseGap` and
+`holdAltitude` policies, which are the control arm of the assist tests claim to
+beat the bots it replaces, asserting the weak bots really die before comparing.
+
+**Two changes await ratification** — a dependency removal and a build-config
+change, both on the standing stop-and-ask list, and the goal authorised only
+adding dependencies. `cupertino_icons` removed, `uses-material-design` off. Both
+are one-line reversions, and both carry a silent trip-wire: the moment any file
+imports `flutter/material.dart` and draws an `Icon` it renders as an empty box
+with no build error. The pubspec comment says so at the line that would change.
+
+**Not measurable here.** Everything on physical hardware. The emulator
+rasterises in software, so 15 ms of raster is perhaps 1-2 ms on a real GPU. The
+shape of the distribution transfers; the absolute milliseconds do not.
