@@ -76,6 +76,13 @@ class FakeHost implements GameScreenHost {
   @override
   bool assistEnabled;
 
+  /// Defaults to TRUE, because that is the default the real game ships with —
+  /// see `FlappyMiataGame._ghostVisible`. A fake that started anywhere else
+  /// would let a screen test pass while the app opened on a setting nobody
+  /// chose, which is the same argument [motionSetting] carries below.
+  @override
+  bool ghostEnabled;
+
   /// Defaults to [MotionSetting.system], because that is the default the real
   /// game ships with — a fake that started anywhere else would let a screen
   /// test pass while the app opened on a setting nobody chose.
@@ -96,12 +103,16 @@ class FakeHost implements GameScreenHost {
     this.isNewBest = false,
     this.paused = false,
     this.assistEnabled = false,
+    this.ghostEnabled = true,
     this.motionSetting = MotionSetting.system,
     this.systemDisablesAnimations = false,
   });
 
   @override
   void toggleAssist() => calls.add('assist');
+
+  @override
+  void toggleGhost() => calls.add('ghost');
 
   @override
   void cycleMotion() => calls.add('motion');
@@ -488,6 +499,57 @@ void main() {
       expect(find.text('RISK'), findsOneWidget);
       expect(find.text('23'), findsOneWidget);
       expect(find.text('ASSIST: OFF'), findsOneWidget);
+    });
+
+    testWidgets('the ghost toggle states what it is, on both stopped screens', (
+      WidgetTester tester,
+    ) async {
+      // Same shape as the assist toggle above, and it is a separate test rather
+      // than an extra line in that one because it is a separate claim: the
+      // control has to exist on BOTH screens the world is stopped on. The
+      // paused screen is the one that matters most here — it is the only place
+      // a player who has just been confused by the ghost mid-run can reach the
+      // switch without throwing the run away.
+      final FakeHost on = FakeHost();
+      await showScreen(tester, StartScreen(host: on));
+      expect(find.text('GHOST: ON'), findsOneWidget,
+          reason: 'the ghost ships on, so a fresh screen must say so');
+      expect(find.text('GHOST: OFF'), findsNothing);
+      await tester.tap(find.text('GHOST: ON'));
+      expect(on.calls, <String>['ghost'],
+          reason: 'the toggle did not reach the game — or the tap fell through '
+              'to the scaffold and started a run instead');
+
+      final FakeHost off =
+          FakeHost(score: 9, paused: true, ghostEnabled: false);
+      await showScreen(tester, PausedScreen(host: off));
+      expect(find.text('GHOST: OFF'), findsOneWidget);
+      expect(find.text('GHOST: ON'), findsNothing);
+      await tester.tap(find.text('GHOST: OFF'));
+      expect(off.calls, <String>['ghost']);
+    });
+
+    testWidgets('every display setting is on both stopped screens', (
+      WidgetTester tester,
+    ) async {
+      // The three controls are three separate widgets added in two separate
+      // places, so "somebody added the fourth one to the start screen only" is
+      // a real and invisible failure. Named here as one list, once.
+      const List<String> controls = <String>[
+        'ASSIST: OFF',
+        'GHOST: ON',
+        'MOTION: AUTO (FULL)',
+      ];
+      for (final Widget screen in <Widget>[
+        StartScreen(host: FakeHost()),
+        PausedScreen(host: FakeHost(paused: true)),
+      ]) {
+        await showScreen(tester, screen);
+        for (final String label in controls) {
+          expect(find.text(label), findsOneWidget,
+              reason: '$label is missing from ${screen.runtimeType}');
+        }
+      }
     });
 
     testWidgets('the game over card reports risk beside the score, not in it', (

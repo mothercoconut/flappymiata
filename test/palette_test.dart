@@ -198,12 +198,12 @@ void main() {
       // so. Without this they can drift, and the drift shows up as one teal
       // being graded and another being drawn.
       int rgb(int argb) => argb & 0x00FFFFFF;
-      expect(rgb(palette.ghostSilhouette), rgb(palette.panelBorder),
+      expect(rgb(palette.ghostOutline), rgb(palette.panelBorder),
           reason: 'the ghost is a different teal from the panels');
       expect(rgb(palette.assistWindow), rgb(palette.panelBorder),
           reason: 'the assist window is a different teal from the panels');
       // And they differ only in alpha, which is the intended difference.
-      expect(alphaOf(palette.ghostSilhouette), lessThan(0xFF));
+      expect(alphaOf(palette.ghostOutline), lessThan(0xFF));
       expect(alphaOf(palette.panelBorder), 0xFF);
     });
 

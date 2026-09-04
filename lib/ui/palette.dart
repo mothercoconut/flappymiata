@@ -119,12 +119,43 @@ const int pipeShadow = 0xFF205A3A;
 
 // -- the cars -----------------------------------------------------------------
 
-/// The recorded best run's car: the sprite's silhouette in one flat colour.
+/// The recorded best run's car: a hollow outline, drawn in this one colour.
 ///
-/// The same RGB as [panelBorder] at 55% alpha — asserted in
-/// `test/palette_test.dart`, so the two cannot drift apart while both claim to
-/// be "the game's teal".
-const int ghostSilhouette = 0x8C8BD3C7;
+/// RENAMED FROM `ghostSilhouette`, AND THE NAME IS THE POINT. It really was a
+/// silhouette — the car sprite flattened to one flat colour — and a player
+/// reported the obvious consequence: "it makes it really hard to see what's you
+/// and what's the ghost." A silhouette is the car's exact outline filled in, so
+/// no colour put inside it can stop it being a second car-shaped mass moving at
+/// speed. The fill is gone; what is left is a stroke. See `_GhostLayer` in
+/// `lib/main.dart` for the full argument.
+///
+/// THE ALPHA WENT UP WITH IT, `0x8C` -> `0xD9`, 55% to 85%, and that is a
+/// consequence of the change rather than a separate opinion. A fill covers
+/// thousands of pixels and can afford to be faint; a 3px stroke covers a few
+/// hundred, and at 55% over a bright green pipe there would not be enough of
+/// its own colour left to be told apart from one. The RGB did not move at all,
+/// so every number below moved for exactly one reason.
+///
+/// MEASURED BOTH WAYS, normal / deuteranopia / protanopia, worst backdrop:
+///
+///   ghost vs a pipe      19.22 / 20.53 / 18.88   ->  27.63 / 29.54 / 27.27
+///   ghost vs the sky     32.00 / 28.39 / 30.74   ->  51.92 / 48.02 / 51.56
+///   ghost vs the live car, worst of four backdrops x three visions
+///   (`test/palette_colourblind_test.dart`, measured off the real PNG):
+///                                       19.02   ->  29.17
+///
+/// All three were already over the bar of 15 and all three went up. Worth being
+/// blunt about what that does and does not mean: the pair that was actually
+/// wrong — the ghost against the live car — scored 19.02 while a player could
+/// not tell them apart. ΔE₀₀ is a distance between two colours, and the defect
+/// was a shape. Colour was never going to fix it and these numbers were never
+/// going to report it.
+///
+/// Still the same RGB as [panelBorder] — asserted in `test/palette_test.dart`,
+/// so the two cannot drift apart while both claim to be "the game's teal" — and
+/// still below full alpha, so the ghost reads as a thing being remembered
+/// rather than a thing that is there.
+const int ghostOutline = 0xD98BD3C7;
 
 // -- assist mode --------------------------------------------------------------
 
@@ -260,7 +291,7 @@ const List<PaletteColour> paletteColours = <PaletteColour>[
   PaletteColour('pipeBody', pipeBody, 'the body of a pipe'),
   PaletteColour('pipeHighlight', pipeHighlight, 'the lit edge of a pipe'),
   PaletteColour('pipeShadow', pipeShadow, 'the shaded edge of a pipe'),
-  PaletteColour('ghostSilhouette', ghostSilhouette, "the best run's car"),
+  PaletteColour('ghostOutline', ghostOutline, "the best run's car, outlined"),
   PaletteColour('assistCoast', assistCoast, 'the coasting path'),
   PaletteColour('assistWindow', assistWindow, 'the offered flap window'),
   PaletteColour('assistDeadline', assistDeadline, 'the tap-by-here mark'),
@@ -591,14 +622,14 @@ List<DistinctPair> get distinctPairs => <DistinctPair>[
         'ghost car vs a pipe',
         'the ghost flies over the pipes; if it disappears into one there is '
             'nothing to race',
-        ghostSilhouette,
+        ghostOutline,
         pipeBody,
         <int>[pipeBody],
       ),
       const DistinctPair(
         'ghost car vs the sky',
         'the same, for the two thirds of the screen that are sky',
-        ghostSilhouette,
+        ghostOutline,
         skyTop,
         <int>[skyTop, skyBottom],
       ),
