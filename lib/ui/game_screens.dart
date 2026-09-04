@@ -39,34 +39,53 @@ import 'package:flame/game.dart';
 import 'package:flutter/widgets.dart';
 
 import 'package:flappymiata/game/game_model.dart';
+import 'package:flappymiata/ui/motion.dart';
+import 'package:flappymiata/ui/palette.dart' as palette;
 
 // -----------------------------------------------------------------------------
-// The palette, taken from lib/main.dart so the screens sit on the game rather
-// than on top of it.
+// The palette.
+//
+// EVERY COLOUR BELOW IS A REFERENCE, NOT A LITERAL. The values live in
+// `lib/ui/palette.dart`, which is the only file in `lib/` allowed to contain a
+// hex colour — `test/palette_test.dart` scans the source and fails the suite if
+// one appears anywhere else. That is what makes "every pair the UI renders is
+// reachable from the palette" a checked fact rather than a habit: a colour that
+// is not in the palette is a colour nothing grades for contrast, and now it is
+// also a colour that will not compile past the tests.
+//
+// These stay declared here, as `Color`s, because that is what the widget tree
+// wants and because `lib/ui/palette.dart` is deliberately pure Dart with no
+// `dart:ui` in it, so that `tool/palette_report.dart` can run it.
 // -----------------------------------------------------------------------------
 
-/// The card's fill. Nearly opaque, so nothing scrolling underneath shows
-/// through the text.
-const Color screenCardBacking = Color(0xF20A1D32);
+/// The card's fill. Fully opaque: see `palette.cardSurface` for why the 5% it
+/// used to let through was a real problem and not a nicety.
+const Color screenCardBacking = Color(palette.cardSurface);
 
 /// The teal that outlines every panel in this game.
-const Color screenBorder = Color(0xFF8BD3C7);
+const Color screenBorder = Color(palette.panelBorder);
 
 /// Text on a card.
-const Color screenInk = Color(0xFFFFFFFF);
+const Color screenInk = Color(palette.ink);
 
 /// Secondary text — labels, hints — dimmer so the numbers read first.
-const Color screenInkDim = Color(0xFFA8C4D8);
+const Color screenInkDim = Color(palette.inkDim);
 
 /// A wash over the whole playfield while a screen is up.
 ///
 /// Translucent rather than opaque on purpose: the pipes and the car stay
 /// visible behind it, so a paused game still looks like the game, and a game
-/// over still shows the wreck it is reporting.
-const Color screenScrim = Color(0xB3061224);
+/// over still shows the wreck it is reporting. No text is ever drawn directly
+/// on it — every label sits on [screenCardBacking] — which is what keeps its
+/// translucency out of the contrast arithmetic.
+const Color screenScrim = Color(palette.scrim);
 
 /// The fill of a button.
-const Color screenButtonFill = Color(0xFF17385C);
+const Color screenButtonFill = Color(palette.buttonFill);
+
+/// The fill of a button that is not the primary one: nothing, so the card shows
+/// through.
+const Color screenButtonPlainFill = Color(palette.buttonPlainFill);
 
 // -----------------------------------------------------------------------------
 // Overlay names.
@@ -208,6 +227,29 @@ abstract class GameScreenHost {
   /// Turns the flap-window highlight on or off. Off is the default.
   void toggleAssist();
 
+  /// What the player has asked for about decorative motion.
+  ///
+  /// Defaults to [MotionSetting.system], which follows the platform's own
+  /// "reduce motion" accessibility switch. See `lib/ui/motion.dart`.
+  MotionSetting get motionSetting;
+
+  /// What that platform switch currently says.
+  ///
+  /// Exposed beside [motionSetting] rather than folded into it because the
+  /// control has to be able to say which of the two decided the answer: "AUTO"
+  /// on its own does not tell a player whether the background is about to
+  /// move.
+  bool get systemDisablesAnimations;
+
+  /// Steps the motion setting on: system, then reduced, then full.
+  ///
+  /// A DISPLAY SETTING AND NOTHING ELSE, exactly like [toggleAssist]. It stops
+  /// the parallax and it changes no rule: the model does not know it exists and
+  /// a run played either way is the same run. `test/reduced_motion_test.dart`
+  /// asserts that frame for frame, because a reduced-motion mode that quietly
+  /// made the game easier would be a different feature wearing this one's name.
+  void cycleMotion();
+
   /// Leaves the start line: the first tap of a run.
   void startRun();
 
@@ -328,7 +370,7 @@ class GameButton extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
         decoration: BoxDecoration(
-          color: primary ? screenButtonFill : const Color(0x00000000),
+          color: primary ? screenButtonFill : screenButtonPlainFill,
           borderRadius: BorderRadius.circular(10),
           border: Border.all(color: screenBorder, width: 2),
         ),
@@ -498,6 +540,8 @@ class StartScreen extends StatelessWidget {
         GameButton(label: 'TAP TO DRIVE', onPressed: host.startRun, primary: true),
         const SizedBox(height: 12),
         AssistToggle(host: host),
+        const SizedBox(height: 12),
+        MotionToggle(host: host),
       ],
     );
   }
@@ -528,6 +572,32 @@ class AssistToggle extends StatelessWidget {
   }
 }
 
+/// The reduced-motion switch, offered beside the assist toggle and for the same
+/// reason: both are display settings, both need their label read, and reading a
+/// label costs a run if it is done during one.
+///
+/// The label states the CURRENT state rather than the action. On
+/// [MotionSetting.system] it also names what the platform resolved to, since
+/// the question somebody presses this to answer is "will the background move",
+/// and only the resolved state answers it.
+class MotionToggle extends StatelessWidget {
+  /// The game.
+  final GameScreenHost host;
+
+  const MotionToggle({super.key, required this.host});
+
+  @override
+  Widget build(BuildContext context) {
+    return GameButton(
+      label: motionSettingLabel(
+        setting: host.motionSetting,
+        systemDisablesAnimations: host.systemDisablesAnimations,
+      ),
+      onPressed: host.cycleMotion,
+    );
+  }
+}
+
 /// While the world is stopped.
 ///
 /// NO `onTapAnywhere`. See [GameScreenScaffold]: the two buttons are the only
@@ -554,6 +624,8 @@ class PausedScreen extends StatelessWidget {
         GameButton(label: 'RESTART', onPressed: host.restartRun),
         const SizedBox(height: 12),
         AssistToggle(host: host),
+        const SizedBox(height: 12),
+        MotionToggle(host: host),
       ],
     );
   }

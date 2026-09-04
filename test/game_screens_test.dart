@@ -31,6 +31,7 @@ import 'package:flappymiata/game/run_code.dart';
 import 'package:flappymiata/main.dart';
 import 'package:flappymiata/ui/game_screens.dart';
 import 'package:flappymiata/ui/high_score_store.dart';
+import 'package:flappymiata/ui/motion.dart';
 
 import '../tool/fairness.dart';
 
@@ -75,6 +76,15 @@ class FakeHost implements GameScreenHost {
   @override
   bool assistEnabled;
 
+  /// Defaults to [MotionSetting.system], because that is the default the real
+  /// game ships with — a fake that started anywhere else would let a screen
+  /// test pass while the app opened on a setting nobody chose.
+  @override
+  MotionSetting motionSetting;
+
+  @override
+  bool systemDisablesAnimations;
+
   /// Every verb the screens invoked, in order.
   final List<String> calls = <String>[];
 
@@ -86,10 +96,15 @@ class FakeHost implements GameScreenHost {
     this.isNewBest = false,
     this.paused = false,
     this.assistEnabled = false,
+    this.motionSetting = MotionSetting.system,
+    this.systemDisablesAnimations = false,
   });
 
   @override
   void toggleAssist() => calls.add('assist');
+
+  @override
+  void cycleMotion() => calls.add('motion');
 
   @override
   void startRun() => calls.add('start');
