@@ -641,15 +641,34 @@ jobs:
         # timing, or whether the runner was simply having a better day. One
         # variable at a time, or the green run teaches nothing.
         #
-        # WHEN IT SHOULD BE LOWERED, stated in advance so the decision is not
-        # re-argued from scratch: if the sampler's `memavail_kb` is seen falling
-        # toward a low-hundreds-of-megabytes figure as the step proceeds, or if
-        # the post-mortem `ps` shows `dartprocs` accumulating across mutants
-        # rather than returning to its floor between them, then `--jobs=1` is
-        # the right move and the only thing it costs is wall clock. Until one of
-        # those two things is actually observed, it stays at 2 — and for the
-        # same one-variable-at-a-time reason it does not go UP to 4 either,
-        # notwithstanding the note above about public runners having 4 cores.
+        # LOWERED TO 1 ON THE EVIDENCE, 2026-09-04. The run at fa8254b was
+        # cancelled by the runner after 1m46s, and the death report said why:
+        #
+        #   pressure/memory: some avg10=64.23  full avg10=60.63
+        #   MemAvailable 8950340 kB , SwapFree 1224180 kB
+        #   ##[error]The operation was canceled.
+        #
+        # `full avg10=60.63` means the WHOLE MACHINE was stalled waiting on
+        # memory for 60% of the preceding ten seconds. Swap had gone from
+        # 3145724 kB free at baseline to 1224180 kB — about 2 GB pushed out.
+        # The runner then cancelled the job, which is who sent the SIGTERM that
+        # started this whole investigation.
+        #
+        # THE RELEASE CONDITION WRITTEN HERE PREVIOUSLY WATCHED THE WRONG
+        # NUMBERS, and that is worth recording rather than quietly replacing.
+        # It said to lower `--jobs` when `memavail_kb` fell toward a few hundred
+        # megabytes, or when `dartprocs` accumulated. Neither happened:
+        # MemAvailable was still 8.9 GB at the moment of death, and the process
+        # count only drifted 163 -> 171. MemAvailable counts reclaimable page
+        # cache, so it stays comfortable right up until the machine is thrashing
+        # to keep it that way. The number that actually showed the fault was
+        # pressure/memory, which is why the sampler collects it.
+        #
+        # Two concurrent `flutter test` trees, each compiling the suite, is
+        # simply more than a 4-core hosted runner will carry. Dropping to one
+        # worker costs wall clock and nothing else: the subset is fixed integer
+        # arithmetic, and each worker judges its own mutant in its own sandbox,
+        # so the job count cannot change a single verdict.
         #
         # `--timeout` is not the thing to change either, and the arithmetic is
         # worth writing down because it is not obvious. 180 seconds is the
@@ -667,7 +686,7 @@ jobs:
         # Nothing here shrinks the mutant budget either. The step is failing for
         # a reason nobody understands yet; weakening the gate until it stops
         # complaining would remove the evidence rather than the fault.
-        run: dart run tool/mutate.dart --quick --jobs=2 --timeout=180 --heartbeat=15
+        run: dart run tool/mutate.dart --quick --jobs=1 --timeout=180 --heartbeat=15
 
       - name: Post-mortem - what the machine looked like when the step ended
         # THE STEP THAT MAKES ALL THE OTHERS WORTH HAVING.

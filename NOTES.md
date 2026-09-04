@@ -682,3 +682,43 @@ hanging forever and reporting nothing.
 reported exit 255 and looked like a tool bug. It was `Select-Object -First 12`
 terminating the PowerShell pipeline, which closes dart's stdout and kills it.
 The tool was fine; the measuring instrument was not.
+
+### The runner was thrashing, and MemAvailable hid it
+
+The instrumented run (fa8254b) failed too, but this time it explained itself:
+
+```
+KILLED BY SIGTERM after 01:46
+  pressure/memory: some avg10=64.23  full avg10=60.63
+  MemAvailable 8950340 kB , SwapFree 1224180 kB
+  machine: 4 cores, MemAvailable 14227732 kB, /tmp is ext4
+##[error]The operation was canceled.
+```
+
+`full avg10=60.63` means the whole machine was stalled waiting on memory for 60%
+of the preceding ten seconds. Swap fell from 3145724 kB free to 1224180 kB —
+about 2 GB pushed out. GitHub's runner then cancelled the job. That cancellation
+is who sent the SIGTERM.
+
+Two concurrent `flutter test` trees, each compiling the suite, is more than a
+4-core hosted runner carries. `--jobs=1` in CI. It costs wall clock and nothing
+else: the subset is fixed integer arithmetic and each worker judges its own
+mutant in its own sandbox, so job count cannot change a verdict.
+
+**The release condition written into the workflow watched the wrong numbers, and
+that is the part worth keeping.** It said to lower `--jobs` if `memavail_kb` fell
+toward a few hundred megabytes or if `dartprocs` accumulated. Neither happened —
+MemAvailable was still 8.9 GB at the moment of death and the process count only
+drifted 163 to 171. MemAvailable counts reclaimable page cache, so it stays
+comfortable right up until the machine is thrashing to keep it that way. The
+number that actually showed the fault was `pressure/memory`, which the sampler
+collected only because it was cheap to add.
+
+A threshold chosen in advance is still a guess. This one was wrong in the safe
+direction — the instrumentation was broad enough that the real signal was in the
+log anyway — but it would have been just as easy to collect only the numbers the
+hypothesis predicted, and then read a clean log as evidence of nothing wrong.
+
+Also ruled out by the same log, at no extra cost: `/tmp is ext4`, so the sandbox
+copies were never charged to RAM as a tmpfs; and `drain stalls so far: 0`, so the
+bounded-drain fix was not itself firing.
