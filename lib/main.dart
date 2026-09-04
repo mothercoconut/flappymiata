@@ -47,10 +47,31 @@ import 'package:flappymiata/game/game_model.dart';
 /// Pipes and car. Lowest, so they are painted underneath everything else.
 const int _worldPriority = 0;
 
+/// The collision-box overlay. Between the world and the HUD on purpose: it has
+/// to cover the pipes it is describing, and it must not cover the score.
+const int _debugPriority = 50;
+
 /// The score panel. Set far above [_worldPriority] rather than one step above
 /// it, so a layer added later — `lib/ui/` will want some — has somewhere to sit
 /// in between without anyone renumbering these.
 const int _hudPriority = 100;
+
+/// FLIP THIS TO SEE THE COLLISION BOXES. One boolean, at the top of the file,
+/// off in anything shipped.
+///
+/// WHY THIS SURVIVES RATHER THAN BEING DELETED ONCE IT HAD FOUND ITS BUG:
+///
+/// The car sprite once drew 2.93x wider than the box it was supposed to be
+/// standing in, so its nose and tail passed straight through pipes without
+/// dying. Nothing about that was visible in the source — the model was right,
+/// the renderer was self-consistent, and the mismatch existed only on screen.
+/// It was eventually pinned down by measuring pixels off a screenshot. Drawing
+/// the boxes over the picture answers the same question in one glance, and goes
+/// on answering it for every change made after this one.
+///
+/// `const` rather than a mutable field, so the compiler can drop the overlay
+/// and its paints out of a release build entirely while it is false.
+const bool kShowCollisionBoxes = false;
 
 void main() {
   runApp(const FlappyMiataApp());
@@ -132,6 +153,14 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
     // entries changes nothing on screen — which is the point of using
     // priorities rather than insertion order.
     await addAll(<Component>[_BackdropLayer(), _WorldLayer(), _panel]);
+
+    // Added only when it is wanted. The alternative — always add it and return
+    // early inside `render` — leaves a component in the tree being asked sixty
+    // times a second to do nothing. [kShowCollisionBoxes] is `const`, so this
+    // branch and everything it reaches are dead code the compiler can drop.
+    if (kShowCollisionBoxes) {
+      await add(_DebugOverlay());
+    }
 
     // So the "tap to start" hint is on screen for the very first frame, rather
     // than appearing only once `update` has run once.
@@ -251,13 +280,42 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
 class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
   _WorldLayer() : super(priority: _worldPriority);
 
-  static const double _miataVisualHeightScale = 1.885;
+  /// How much bigger the drawn car is than its collision box.
+  ///
+  /// The hitbox is ~91% of the drawn car. A slightly forgiving hitbox is the
+  /// convention in this genre - it reads as fair, where the reverse reads as
+  /// broken. Any value here is a deliberate design choice, not a fudge.
+  ///
+  /// WHAT THIS REPLACED: `_miataVisualHeightScale = 1.885`, a factor applied to
+  /// the box's HEIGHT with the width then taken from the image's own
+  /// proportions. That could not have worked. The box was 108 x 120 px on the
+  /// test device — nearly square — while the car is 2.383 : 1, so any scale
+  /// that made the height look right made the width 2.93x too large, and the
+  /// nose and tail of the car passed through pipes untouched. The fix was not a
+  /// better constant; it was giving the BOX the sprite's shape, which is what
+  /// `GameModel.carWidth` now does. With the shapes already agreeing, a single
+  /// uniform scale is the only thing left to choose.
+  static const double _spriteOversize = 1.10;
+
   static const double _pipeCapHeight = 44.0;
 
   static final Paint _pipeOutline = Paint()..color = const Color(0xFF153D2B);
   static final Paint _pipeBody = Paint()..color = const Color(0xFF2D7A4A);
   static final Paint _pipeHighlight = Paint()..color = const Color(0xFF65B96C);
   static final Paint _pipeShadow = Paint()..color = const Color(0xFF205A3A);
+
+  /// Stated rather than left at the default, because the default for
+  /// `drawImageRect` is `FilterQuality.low` — a single bilinear sample, which
+  /// throws source pixels away when an image is minified. `miatasprite.png` is
+  /// a downscaled high-resolution render, not pixel art: 286 source pixels are
+  /// drawn into roughly 195, so at low quality the car's outlines crawl and
+  /// shimmer as it moves. `medium` samples a mipmap chain, averaging the pixels
+  /// being skipped instead of ignoring them. `none` (nearest neighbour) is the
+  /// right answer for pixel art and exactly the wrong one here.
+  static final Paint _spritePaint = Paint()
+    ..filterQuality = FilterQuality.medium
+    ..isAntiAlias = true;
+
   ui.Image? _miataImage;
 
   @override
@@ -278,18 +336,31 @@ class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
     final ui.Image? miataImage = _miataImage;
     if (miataImage == null) return;
 
+    final Vector2 screen = game.size;
+
     for (final Obstacle obstacle in game.model.obstacles) {
-      _drawPipe(canvas, _toPixels(obstacle.topBox), capAtBottom: true);
-      _drawPipe(canvas, _toPixels(obstacle.bottomBox));
+      _drawPipe(canvas, _toPixels(obstacle.topBox, screen), capAtBottom: true);
+      _drawPipe(canvas, _toPixels(obstacle.bottomBox, screen));
     }
 
-    final Rect carRect = _toPixels(game.model.carBox);
-    final double visualHeight = carRect.height * _miataVisualHeightScale;
-    final double visualWidth = visualHeight * miataImage.width / miataImage.height;
+    // THE CAR IS DRAWN AT ITS HITBOX, scaled by one number on both axes.
+    //
+    // Not "sized from the image and then centred on the box", which is what
+    // this did before and is how the two came apart: the image's proportions
+    // and the box's proportions were two independent facts and nothing made
+    // them agree. The box now carries the sprite's aspect — `GameModel.carWidth`
+    // is derived from `carSpriteAspect` — so drawing into the box IS drawing at
+    // the right shape, and the only decision left is how much bigger the
+    // picture is than the box: [_spriteOversize], one constant, one meaning.
+    //
+    // Centred rather than anchored to an edge, so the forgiveness is even: the
+    // extra 10% hangs off the nose and the tail equally, and off the roof and
+    // the sills equally.
+    final Rect carRect = _toPixels(game.model.carBox, screen);
     final Rect visualRect = Rect.fromCenter(
       center: carRect.center,
-      width: visualWidth,
-      height: visualHeight,
+      width: carRect.width * _spriteOversize,
+      height: carRect.height * _spriteOversize,
     );
     canvas.drawImageRect(
       miataImage,
@@ -300,7 +371,7 @@ class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
         miataImage.height.toDouble(),
       ),
       visualRect,
-      Paint(),
+      _spritePaint,
     );
   }
 
@@ -345,31 +416,92 @@ class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
     canvas.drawRect(opening, _pipeShadow);
   }
 
-  /// THE ONE CONVERSION THE MODEL REFUSES TO DO: a normalised box — 0..1 on
-  /// both axes — becomes pixels by multiplying x by the screen width and y by
-  /// the screen height.
-  ///
-  /// WHY IT HAPPENS HERE, AT RENDER TIME, RATHER THAN ONCE AT STARTUP: the
-  /// screen size is not a constant. It changes on rotation, on a window resize,
-  /// on a foldable opening. Converting every frame means the game is always
-  /// drawn against the size it actually has right now, and the model never has
-  /// to be told that anything moved — the numbers in it are fractions of the
-  /// playfield, so they were already correct at both sizes. That is also what
-  /// makes a phone and a tablet play an identical game.
-  ///
-  /// The two axes are scaled by different numbers, so a shape that is square in
-  /// model coordinates comes out stretched on a tall screen. Accepted: the car
-  /// and the pipes are rectangles either way, and nothing in the rules is
-  /// affected, because collision is tested in model coordinates and never in
-  /// pixels.
-  Rect _toPixels(Box box) {
+}
+
+/// THE ONE CONVERSION THE MODEL REFUSES TO DO: a normalised box — 0..1 on both
+/// axes — becomes pixels by multiplying x by the screen width and y by the
+/// screen height.
+///
+/// WHY IT HAPPENS AT RENDER TIME RATHER THAN ONCE AT STARTUP: the screen size
+/// is not a constant. It changes on rotation, on a window resize, on a foldable
+/// opening. Converting every frame means the game is always drawn against the
+/// size it actually has right now, and the model never has to be told that
+/// anything moved — the numbers in it are fractions of the playfield, so they
+/// were already correct at both sizes. That is also what makes a phone and a
+/// tablet play an identical game.
+///
+/// WHY IT IS A TOP-LEVEL FUNCTION AND NOT A METHOD ON THE LAYER THAT DRAWS:
+/// the debug overlay's whole job is to show where the collision boxes really
+/// are. If it converted coordinates with its own slightly different copy of
+/// this arithmetic, it would be capable of drawing a box somewhere the game
+/// does not think it is — an instrument that can disagree with the thing it
+/// measures is worse than no instrument at all. One function, both callers.
+///
+/// THE ASPECT COUPLING, which is why the bug this file just fixed was possible:
+/// the two axes are scaled by DIFFERENT numbers, so a box's shape on screen
+/// depends on the screen. `GameModel.referenceAspect` records the aspect the
+/// boxes were designed at, and what a renderer at any other aspect is signing
+/// up for. Nothing in the rules is affected either way, because collision is
+/// tested in model coordinates and never in pixels.
+Rect _toPixels(Box box, Vector2 screen) => Rect.fromLTRB(
+  box.left * screen.x,
+  box.top * screen.y,
+  box.right * screen.x,
+  box.bottom * screen.y,
+);
+
+/// Draws the collision boxes the rules actually use, straight over the picture
+/// they are meant to match. Present only when [kShowCollisionBoxes] is true.
+///
+/// Outlines, never fills: the point is to compare a box against the art
+/// underneath it, and a filled box hides the one thing being checked.
+class _DebugOverlay extends Component with HasGameReference<FlappyMiataGame> {
+  _DebugOverlay() : super(priority: _debugPriority);
+
+  /// Three distinct hues rather than one debug colour, so a screenshot of this
+  /// can be read without a legend: pink is the car, amber is a pipe, cyan is
+  /// the middle of the gap.
+  static final Paint _carOutline = Paint()
+    ..color = const Color(0xFFFF2D78)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 2;
+
+  static final Paint _obstacleOutline = Paint()
+    ..color = const Color(0xFFFFC13B)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 2;
+
+  static final Paint _gapCentreLine = Paint()
+    ..color = const Color(0xFF3BE0FF)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 2;
+
+  @override
+  void render(Canvas canvas) {
     final Vector2 screen = game.size;
-    return Rect.fromLTRB(
-      box.left * screen.x,
-      box.top * screen.y,
-      box.right * screen.x,
-      box.bottom * screen.y,
-    );
+
+    // Obstacles first and the car last, so the car's outline stays on top on
+    // the frames where it overlaps a pipe — which are exactly the frames
+    // anybody turns this overlay on to look at.
+    for (final Obstacle obstacle in game.model.obstacles) {
+      canvas.drawRect(_toPixels(obstacle.topBox, screen), _obstacleOutline);
+      canvas.drawRect(_toPixels(obstacle.bottomBox, screen), _obstacleOutline);
+
+      // The gap centre, drawn across the obstacle's own width rather than the
+      // whole screen: it is a property of this obstacle, and a full-width line
+      // would read as a global guide the game does not have.
+      final double centreY = obstacle.gapCentre * screen.y;
+      canvas.drawLine(
+        Offset(obstacle.left * screen.x, centreY),
+        Offset(obstacle.right * screen.x, centreY),
+        _gapCentreLine,
+      );
+    }
+
+    // `game.model.carBox` — the same getter `tick` collides with, not a rect
+    // rebuilt here out of the constants. Reading the model's own box is what
+    // makes this overlay evidence rather than a second opinion.
+    canvas.drawRect(_toPixels(game.model.carBox, screen), _carOutline);
   }
 }
 

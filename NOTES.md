@@ -247,3 +247,65 @@ of the app.
 obstacles, collision and scoring all work and are covered by 31 tests. Not
 present: high-score persistence, a difficulty ramp, pause, and sound hooks. None
 of those are required for this project.
+
+## 2026-09-03 — Phase 1: merge sprite UI, fix the sprite/hitbox mismatch
+
+Start of an open-ended quality pass. Project 2 is already submitted; none of
+this is on a deadline.
+
+**Merged.** `sprite-ui` (@Sdav239) into trunk: pixel Miata sprite, parallax
+background, capped pipes, styled score panel.
+
+**The bug.** The car drew about three times wider than the box that kills you.
+Measured on a 1080x2400 screen:
+
+```
+hitbox        108 x 120 px      carWidth 0.10, carHeight 0.05
+drawn rect    339 x 226 px      1.885 x hitbox height, image aspect 1.5
+visible car   316 x 132 px      the PNG was 45.4% transparent padding
+                                -> width 2.93x the hitbox, height 1.10x
+```
+
+Height was always about right; a ~10% margin is the convention. Width was the
+whole defect: the nose and tail passed through pipes without dying.
+
+**Root cause, which was not the magic number.** `_toPixels` scales normalised x
+by screen width and y by screen height independently. So a box of 0.10 x 0.05 is
+108 x 120 px here — aspect 0.9, nearly square — while the car is aspect 2.383.
+No single scale factor reconciles those. The hitbox's *shape* silently depended
+on the device's aspect ratio, and nothing said so.
+
+**Fix.** The dependency is now named and derived rather than implied:
+
+```dart
+static const double referenceAspect = 2400 / 1080;   // the frame boxes mean
+static const double carSpriteAspect = 286 / 120;     // the sprite's own pixels
+static const double carHeight = 0.031;
+static const double carWidth  = carHeight * referenceAspect * carSpriteAspect;
+```
+
+carWidth comes out at 0.164185 — a hitbox of 177.3 x 74.4 px at the reference
+aspect, the same shape as the sprite, and within 1.8% of the old hitbox's *area*
+so difficulty did not jump. The renderer draws the sprite into that box inflated
+by 1.10, making the hitbox ~91% of the visible car.
+
+**Assets.** `miatasprite.png` was cropped to its opaque bounds and downscaled
+5x with a premultiplied box filter, then re-encoded with per-row adaptive PNG
+filtering: 1536x1024 and 1034 KB became 286x120 and 37 KB, 96.4% smaller, with
+the aspect ratio preserved exactly. `mario2.png` was deleted — 875 KB, zero
+references anywhere in the repo.
+
+**Debug overlay.** New, off by default behind `kShowCollisionBoxes`. Draws the
+car's hitbox, both obstacle boxes and each gap centre. It exists because this
+bug took pixel measurement off a screenshot to find, and would have taken ten
+seconds to see.
+
+**Verified on device, not asserted.** With the overlay on, the rendered hitbox
+measured 182 x 80 px against a computed 177.3 x 74.4. The difference is the
+outline stroke, which is centred on the box edge and so adds about 5 px to each
+dimension; subtracting it lands exactly on the computed size.
+
+**Where a number stood in for taste.** `carHeight = 0.031` was chosen to hold
+the hitbox *area* roughly constant, not because 0.031 feels right. The danger
+window grew from 0.578s to 0.720s as a result. Phase 2's simulator measures
+whether that is actually harder; until then it is an assumption.

@@ -128,22 +128,82 @@ class GameModel {
   /// the picture does not move when the rules arrive.
   static const double carX = 0.30;
 
-  /// Width of the car's collision box, in playfield-widths.
+  /// Aspect (height / width) of the screen the collision boxes are defined
+  /// for. Normalised x and y are scaled by screen width and height
+  /// independently, so a box's real shape depends on this. Stating it here
+  /// makes the dependency reviewable instead of accidental.
   ///
-  /// PLAYABLE BECAUSE: a tenth of the screen. Together with [obstacleWidth] it
-  /// sets how long the car spends level with a pipe — the danger window is
-  /// (carWidth + obstacleWidth) / scrollSpeed, about 0.58s here, which is close
-  /// to the original's 0.6s. Wider than the drawn car would feel unfair; the
-  /// box is meant to be the generous reading of where the car is.
-  static const double carWidth = 0.10;
+  /// THE TRAP THIS CONSTANT CLOSES, spelled out once because it is the least
+  /// obvious thing in this file and it has already cost one bug:
+  ///
+  /// Normalised coordinates make the game screen-independent in POSITION and
+  /// screen-DEPENDENT in SHAPE. A renderer turns a normalised box into pixels
+  /// by multiplying x by the screen width and y by the screen height — two
+  /// different numbers — so "0.10 wide by 0.05 tall" is 108 x 120 px on a
+  /// 1080 x 2400 phone, taller than it is wide, and 108 x 54 px on a square
+  /// 1080 x 1080 one, twice as wide as it is tall. Same two numbers, two
+  /// different shapes. Nothing in this file can notice, because collision is
+  /// tested in normalised coordinates where a box is exactly what the numbers
+  /// say it is.
+  ///
+  /// That is harmless while the car is an abstract rectangle. It stops being
+  /// harmless the moment a sprite with proportions of its own has to sit inside
+  /// that rectangle: for a 286 x 120 image to fill its hitbox, the hitbox has
+  /// to come out 2.383 : 1 ON SCREEN — and what shape it comes out is a fact
+  /// about the screen, not about the numbers. So the screen has to be named,
+  /// and this is where it is named.
+  ///
+  /// THE CONTRACT FOR A RENDERER RUNNING AT A DIFFERENT ASPECT: either
+  /// letterbox the playfield to [referenceAspect] and draw inside that, or
+  /// accept that the car's drawn shape drifts from the sprite's. Nothing here
+  /// implements letterboxing and this file does not care which is chosen — it
+  /// only insists the choice is made knowingly rather than discovered later.
+  /// `lib/main.dart` currently takes the second option: it fills the window, so
+  /// on a screen far from 20:9 the car is drawn slightly stretched or squashed.
+  /// The GAME is identical either way, because the rules never see a pixel.
+  static const double referenceAspect = 2400 / 1080;
+
+  /// Width / height of the Miata sprite's own pixels (286 x 120).
+  ///
+  /// The asset is cropped to its opaque bounds, so this is the car's shape and
+  /// not the shape of a canvas with transparent margins around it. Re-export
+  /// the artwork at different proportions and this number has to change with
+  /// it; `test/car_geometry_test.dart` pins the hitbox to it so that cannot be
+  /// forgotten silently.
+  static const double carSpriteAspect = 286 / 120;
 
   /// Height of the car's collision box, in playfield-heights.
   ///
-  /// PLAYABLE BECAUSE: [gapHeight] divided by this is 5.6, so a gap is between
-  /// five and six car-heights tall. Flappy Bird's is about 4.2. Slightly
-  /// roomier on purpose: this game is a course deliverable that has to be
-  /// demonstrable on camera, not a test of the presenter's reflexes.
-  static const double carHeight = 0.05;
+  /// PLAYABLE BECAUSE: [gapHeight] divided by this is 9.0, so a gap is nine
+  /// car-heights tall. Flappy Bird's is about 4.2 — but its bird is nearly
+  /// square and this car is two and a third times wider than it is tall, so the
+  /// quantity that actually sets difficulty here is the AREA the box sweeps,
+  /// not its height in isolation. That area is what was held fixed; see
+  /// [carWidth].
+  static const double carHeight = 0.031;
+
+  /// Width of the car's collision box, in playfield-widths. DERIVED, never
+  /// typed in — that derivation is the entire point of the two constants above.
+  ///
+  /// Multiplying by [referenceAspect] converts a height in playfield-heights
+  /// into the width that draws the same number of pixels; multiplying by
+  /// [carSpriteAspect] then stretches that square into the car's real
+  /// proportions. The result, 0.1642, is a box of 177.3 x 74.4 px at the
+  /// reference aspect — the same 2.383 : 1 as the sprite, so the drawn car
+  /// fills it edge to edge instead of overhanging it.
+  ///
+  /// WHY DIFFICULTY DID NOT JUMP WHEN THIS CHANGED: the previous pair (0.10 by
+  /// 0.05, both hand-picked) covered 12960 px^2 at the reference aspect; this
+  /// pair covers 13193, which is 1.8% more. The box is now much wider and much
+  /// shorter — a genuine change in WHICH near misses are survivable — but it
+  /// occupies the same fraction of the screen, so a run is neither noticeably
+  /// easier nor harder. `test/car_geometry_test.dart` pins that within 5%.
+  ///
+  /// The danger window, the time the car spends level with a pipe, is
+  /// (carWidth + obstacleWidth) / scrollSpeed = 0.72s, up from 0.58s. Longer
+  /// because the box really is wider now, and paid for by a gap that is nine
+  /// car-heights tall instead of five and a half.
+  static const double carWidth = carHeight * referenceAspect * carSpriteAspect;
 
   /// Width of one obstacle, in playfield-widths.
   ///
@@ -171,7 +231,7 @@ class GameModel {
 
   /// Height of the flyable gap, in playfield-heights.
   ///
-  /// PLAYABLE BECAUSE: 0.28 is 5.6 car-heights (see [carHeight]) and it is also
+  /// PLAYABLE BECAUSE: 0.28 is 9.0 car-heights (see [carHeight]) and it is also
   /// wider than one full flap arc — a flap climbs 0.118 — so a player can flap
   /// *inside* a gap without immediately clipping its ceiling. That last
   /// property is what makes the gap threadable rather than a coin flip.

@@ -521,7 +521,11 @@ void main() {
       }
 
       // The window is (carWidth + obstacleWidth) / scrollSpeed seconds, about
-      // 35 frames at 60fps.
+      // 43 frames at 60fps. It was 35 while carWidth was 0.10; the box is now
+      // derived from the sprite's proportions and is genuinely wider, so the
+      // car spends longer level with each pipe. The bound below stays at 30
+      // because its job is to prove the car reached a pipe at all, not to pin
+      // the tuning — `test/car_geometry_test.dart` pins the tuning.
       expect(
         crossingFrames,
         greaterThanOrEqualTo(30),
