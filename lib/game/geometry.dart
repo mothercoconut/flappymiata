@@ -146,6 +146,26 @@ class Obstacle {
   /// car.
   final bool scored;
 
+  /// The closest this obstacle's pipes have ever come to the car, in
+  /// playfield-heights. [double.infinity] until the car has been level with it
+  /// at all.
+  ///
+  /// WHY IT LIVES ON THE OBSTACLE AND NOT ON THE MODEL, which is the same
+  /// argument [scored] makes and for the same reason: the measurement is a fact
+  /// ABOUT THIS PIPE. Keeping it here means it travels with the thing it
+  /// describes, it is thrown away when the obstacle leaves the screen, and the
+  /// model never has to hold a side-map of index-to-clearance that somebody has
+  /// to remember to prune.
+  ///
+  /// WHY INFINITY RATHER THAN NULL OR ZERO. Zero would be a lie — zero is the
+  /// clearance of a pass that shaved the lip, which is the most impressive
+  /// thing in the game, and an unmeasured obstacle must never be confused with
+  /// that one. Null would make every arithmetic use of this field a null check.
+  /// Infinity is the identity of `min`, so "no measurement yet" and "the
+  /// smallest measurement so far" are the same expression, and it is `isFinite`
+  /// that separates them.
+  final double minClearance;
+
   const Obstacle({
     required this.index,
     required this.x,
@@ -153,6 +173,7 @@ class Obstacle {
     required this.gapCentre,
     required this.gapHeight,
     this.scored = false,
+    this.minClearance = double.infinity,
   });
 
   /// Left edge, in playfield-widths.
@@ -175,6 +196,67 @@ class Obstacle {
   Box get bottomBox =>
       Box(left: left, top: gapBottom, right: right, bottom: playfieldBottom);
 
+  /// The clearance a PERFECTLY CENTRED pass through this gap would have, for a
+  /// car [carHeight] tall — i.e. all the room this obstacle has to give.
+  ///
+  /// Half, because the spare height is shared between the pipe above and the
+  /// pipe below: a car sitting dead centre is this far from each of them.
+  /// Negative when the gap is shorter than the car, which is a gap nothing can
+  /// pass; the shipped game cannot build one, and callers that might be handed
+  /// one say what they do about it.
+  double roomFor(double carHeight) => (gapHeight - carHeight) / 2;
+
+  /// True when a car spanning [carLeft] to [carRight] is LEVEL with this
+  /// obstacle — the x half of [Box.overlaps], and therefore exactly the frames
+  /// on which this pipe could collide with that car.
+  ///
+  /// Strict on both sides, matching [Box.overlaps]: a car whose nose is exactly
+  /// on the pipe's left edge has not reached it yet.
+  ///
+  /// WHY THIS IS A METHOD RATHER THAN TWO COMPARISONS AT THE ONE PLACE THAT
+  /// NEEDS IT. `GameModel.tick` needs it to decide which frames a clearance is
+  /// measured over, and written inline there the boundary is UNTESTABLE: pipe
+  /// positions come out of the physics, so no test can arrange for an obstacle
+  /// edge to land on exactly the car's edge, and `<` and `<=` would differ only
+  /// on that unreachable input. As a function of two doubles the boundary is one
+  /// line of a test — which is the same reason `Box.overlaps` is its own method
+  /// rather than four comparisons inside the collision check.
+  bool isLevelWith(double carLeft, double carRight) =>
+      carLeft < right && carRight > left;
+
+  /// The smallest distance between [car] and either of this obstacle's two
+  /// pipes, in playfield-heights.
+  ///
+  /// Zero means the car's roof or its sills sat exactly on a pipe lip — the
+  /// closest a pass can be without being a crash, because [Box.overlaps] is
+  /// strict. Negative means the boxes are genuinely overlapping, which
+  /// `GameModel.tick` reads as a collision on the same frame.
+  ///
+  /// ONLY MEANINGFUL WHILE THE CAR AND THE OBSTACLE OVERLAP HORIZONTALLY. Once
+  /// a pipe is beside the car, the gap between the two boxes is purely
+  /// vertical, so a single number says everything. Ahead of that the nearest
+  /// point of the pipe is diagonally away and this number means nothing;
+  /// `GameModel.tick` is what restricts the measurement to the frames where it
+  /// does mean something.
+  ///
+  /// WHY IT IS WRITTEN AS "ROOM MINUS HOW FAR OFF CENTRE" RATHER THAN AS THE
+  /// MINIMUM OF TWO DISTANCES, which is what the sentence above describes:
+  ///
+  ///     to the upper pipe   a = car.top    - gapTop
+  ///     to the lower pipe   b = gapBottom  - car.bottom
+  ///
+  ///     a + b = gapHeight - carHeight = 2 * roomFor(carHeight)
+  ///     a - b = 2 * (gapCentre - carCentre)
+  ///
+  /// so min(a, b) = (a + b)/2 - |a - b|/2 = roomFor(carHeight) - |carCentre -
+  /// gapCentre|, exactly, with no comparison in it. That matters twice over: it
+  /// is the same number by algebra rather than by a branch a reader has to
+  /// check, and it says out loud what the quantity MEANS — the room this gap
+  /// had, less however much of it the driver gave away by not being centred.
+  double clearanceTo(Box car) =>
+      roomFor(car.bottom - car.top) -
+      ((car.top + car.bottom) / 2 - gapCentre).abs();
+
   /// This obstacle shifted by [dx] playfield-widths. Negative moves it left,
   /// toward the car.
   Obstacle movedBy(double dx) => Obstacle(
@@ -184,6 +266,7 @@ class Obstacle {
     gapCentre: gapCentre,
     gapHeight: gapHeight,
     scored: scored,
+    minClearance: minClearance,
   );
 
   /// This obstacle, marked as having paid out its point. One-way: nothing
@@ -196,7 +279,40 @@ class Obstacle {
     gapCentre: gapCentre,
     gapHeight: gapHeight,
     scored: true,
+    minClearance: minClearance,
   );
+
+  /// This obstacle, remembering that the car came within [clearance] of it.
+  ///
+  /// Keeps the SMALLER of the two, so calling it on every frame the car spends
+  /// level with this pipe leaves the closest approach behind. Monotone
+  /// downward, in the same way [markScored] is one-way: a run cannot improve
+  /// its record against a pipe by flying wide of it afterwards, and a pipe
+  /// cannot be talked out of a scrape that already happened.
+  ///
+  /// RETURNS THE RECEIVER WHEN NOTHING IMPROVED, and that is a property rather
+  /// than an optimisation detail — `test/risk_score_test.dart` asserts the
+  /// identity, in "a repeat of the current minimum is not a change". Two
+  /// reasons it is worth having:
+  ///
+  ///   1. A pipe is level with the car for about 43 frames and only a few of
+  ///      those are new minima, so the common case allocates nothing.
+  ///   2. It pins the boundary. `>=` and `>` differ on exactly one input — a
+  ///      repeat of the current minimum — and both produce an EQUAL obstacle,
+  ///      so a value comparison could never tell them apart. Identity can, and
+  ///      that is what stops this line being a comparison no test can reach.
+  Obstacle withClearance(double clearance) {
+    if (clearance >= minClearance) return this;
+    return Obstacle(
+      index: index,
+      x: x,
+      width: width,
+      gapCentre: gapCentre,
+      gapHeight: gapHeight,
+      scored: scored,
+      minClearance: clearance,
+    );
+  }
 
   @override
   bool operator ==(Object other) =>
@@ -207,13 +323,16 @@ class Obstacle {
           other.width == width &&
           other.gapCentre == gapCentre &&
           other.gapHeight == gapHeight &&
-          other.scored == scored;
+          other.scored == scored &&
+          other.minClearance == minClearance;
 
   @override
-  int get hashCode => Object.hash(index, x, width, gapCentre, gapHeight, scored);
+  int get hashCode =>
+      Object.hash(index, x, width, gapCentre, gapHeight, scored, minClearance);
 
   @override
   String toString() =>
       'Obstacle(#$index, x: $x, gapCentre: $gapCentre, '
-      'gapHeight: $gapHeight, scored: $scored)';
+      'gapHeight: $gapHeight, scored: $scored, '
+      'minClearance: $minClearance)';
 }

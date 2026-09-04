@@ -13,6 +13,7 @@ import 'dart:io';
 import 'package:flappymiata/game/game_model.dart';
 
 import 'headless_sim.dart';
+import 'solver_bot.dart';
 
 void main(List<String> args) {
   final Map<String, String> opts = _parseArgs(args);
@@ -25,14 +26,18 @@ void main(List<String> args) {
     'always': alwaysFlap,
     'hold': holdAltitude(0.5),
     'chase': chaseGap(),
+    // The only one of these that can still play the ramped game. See
+    // `tool/solver_bot.dart`: it is not a heuristic, it reads the surviving
+    // states out of the assist solver and never leaves them.
+    'solver': solverPolicy(),
   };
 
   stdout.writeln('Headless simulator — GameModel at ${(1 / frameSeconds).round()}fps');
   stdout.writeln('frame budget: $frames frames '
       '(${(frames * frameSeconds).toStringAsFixed(1)}s of game time)');
   stdout.writeln('');
-  stdout.writeln('policy    outcome         score  passed  frames  flaps  finalY');
-  stdout.writeln('-------------------------------------------------------------------');
+  stdout.writeln('policy    outcome         score   risk  passed  frames  flaps  finalY');
+  stdout.writeln('--------------------------------------------------------------------------');
 
   for (final MapEntry<String, Policy> entry in policies.entries) {
     if (wanted != 'all' && wanted != entry.key) continue;
@@ -41,6 +46,7 @@ void main(List<String> args) {
       '${entry.key.padRight(10)}'
       '${r.outcome.name.padRight(16)}'
       '${r.score.toString().padLeft(5)}'
+      '${r.finalModel.riskScore.toString().padLeft(7)}'
       '${r.obstaclesPassed.toString().padLeft(8)}'
       '${r.frames.toString().padLeft(8)}'
       '${r.flaps.toString().padLeft(7)}'

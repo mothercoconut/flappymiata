@@ -29,6 +29,7 @@ import 'package:flappymiata/game/course_seed.dart';
 import 'package:flappymiata/game/game_model.dart';
 import 'package:flappymiata/game/replay.dart';
 import 'package:flappymiata/game/run_code.dart';
+import 'package:flappymiata/ui/assist.dart';
 import 'package:flappymiata/ui/game_screens.dart';
 import 'package:flappymiata/ui/high_score_store.dart';
 
@@ -65,6 +66,11 @@ const int _worldPriority = 0;
 /// The recorded best run's car. Above the pipes so it can be seen at all,
 /// below the live car so it can never obscure the one the player is steering.
 const int _ghostPriority = 10;
+
+/// The flap-window highlight. Above the pipes, because a line hidden behind the
+/// thing it is about is no help; below both cars, because an advisory overlay
+/// must never be the reason a player cannot see where their car is.
+const int _assistPriority = 15;
 
 /// The live car.
 const int _carPriority = 20;
@@ -237,6 +243,23 @@ class FlappyMiataGame extends FlameGame
   /// nothing would be a lie about a game that has been played.
   bool _hasBestScore = false;
 
+  /// Whether the run currently on screen beat the record.
+  ///
+  /// LATCHED, not recomputed. [_captureFinishedRun] runs on every frame after a
+  /// run ends, and by its second pass `_bestScore` already IS this run's score —
+  /// so anything derived at that point would say "no" about the run that had
+  /// just said "yes", and the card would flash NEW BEST for exactly one frame.
+  /// It is written once, inside the branch that stores the new best, and reset
+  /// by [_startRun].
+  ///
+  /// STRICTLY BETTER, not "at least as good". A run that ties the record did not
+  /// set it, and a first run that scores nothing sets a best of 0 without
+  /// beating anything — which is the bug this replaced. `_bestScore` starts at
+  /// 0, so `score > _bestScore` is false for that run and true for any run that
+  /// actually got somewhere, with no special case for the first run of a
+  /// session.
+  bool _isNewBest = false;
+
   /// Whether the world is stopped.
   ///
   /// THIS IS THE WHOLE OF PAUSING, and it needs no clock, no timer and no new
@@ -251,6 +274,22 @@ class FlappyMiataGame extends FlameGame
   /// has three values and none of them is `paused`, on purpose — stopping the
   /// world is a rendering decision, and this is the renderer.
   bool _paused = false;
+
+  /// The assist solver, or null when assist mode is off — which is the default,
+  /// and is also what "off" MEANS here. See [toggleAssist].
+  AssistSolver? _assist;
+
+  /// The current backward pass, reused for about a second. Rebuilt when it stops
+  /// covering the frame the run is on, and thrown away on a restart.
+  AssistPlan? _assistPlan;
+
+  /// What to draw this frame, or null when there is nothing to say.
+  ///
+  /// RECOMPUTED IN `update`, NOT IN `render`. A `render` that computed anything
+  /// would be doing it on whatever schedule the device felt like painting at,
+  /// and the advice is about the frame the MODEL is on. Working it out beside
+  /// the step that produced that frame keeps the two in step by construction.
+  AssistAdvice? _advice;
 
   /// The recorded best run, being replayed alongside the live one.
   ///
@@ -268,6 +307,10 @@ class FlappyMiataGame extends FlameGame
 
   /// The ghost's snapshot, or null when there is nothing to race.
   GameModel? get ghostModel => _ghost?.model;
+
+  /// This frame's flap-window advice, or null when assist mode is off or has
+  /// nothing to say. Read-only, for the layer that draws it.
+  AssistAdvice? get advice => _advice;
 
   // ---------------------------------------------------------------------------
   // GameScreenHost — everything the screens in `lib/ui/` are allowed to see.
@@ -291,13 +334,46 @@ class FlappyMiataGame extends FlameGame
   int get score => _run.model.score;
 
   @override
+  int get riskScore => _run.model.riskScore;
+
+  @override
   int get bestScore => _bestScore;
 
   @override
   bool get hasBestScore => _hasBestScore;
 
   @override
+  bool get isNewBest => _isNewBest;
+
+  @override
   bool get paused => _paused;
+
+  @override
+  bool get assistEnabled => _assist != null;
+
+  /// Turns the flap-window highlight on and off.
+  ///
+  /// SWITCHING IT ON ALLOCATES, switching it off releases. The solver's bitmaps
+  /// are about a megabyte and a half, and a player who never turns assist on
+  /// should not be carrying them — which is also why the null-ness of [_assist]
+  /// IS the setting, rather than a bool beside an always-present solver that
+  /// could disagree with it.
+  ///
+  /// Nothing about the run is touched. There is no `_run` here, no `tick`, and
+  /// nothing queued: the model cannot tell this happened, which is the property
+  /// `test/assist_test.dart` asserts.
+  @override
+  void toggleAssist() {
+    if (_assist == null) {
+      _assist = AssistSolver();
+    } else {
+      _assist = null;
+      _assistPlan = null;
+      _advice = null;
+    }
+    _syncScreens();
+    _revision.value++;
+  }
 
   /// The first tap of a run, from the start screen.
   ///
@@ -399,6 +475,7 @@ class FlappyMiataGame extends FlameGame
       _BackdropLayer(),
       _WorldLayer(),
       _GhostLayer(),
+      _AssistLayer(),
       _CarLayer(),
       _panel,
     ]);
@@ -458,6 +535,20 @@ class FlappyMiataGame extends FlameGame
     if (!_hasBestScore || stored.score > _bestScore) {
       _bestScore = stored.score;
       _hasBestScore = true;
+    }
+
+    // AND THE CLAIM HAS TO BE RE-EXAMINED, because the record it was made
+    // against has just changed underneath it. The window is small — the store
+    // has to answer AFTER a whole run has been played and lost — but it is the
+    // same defect the `>=` on the game-over card was: a run that beat nothing
+    // saying it beat something. Here the run really did beat the best KNOWN at
+    // the time, and then an older, better record turned up. It did not set the
+    // record after all.
+    // Compared against the STORED score rather than against `_bestScore`, which
+    // this run may itself have just set: `score <= _bestScore` is true for every
+    // record-setting run and would withdraw every claim there is.
+    if (_isNewBest && stored.score >= _run.model.score) {
+      _isNewBest = false;
     }
 
     final Replay? replay = stored.replay;
@@ -526,6 +617,17 @@ class FlappyMiataGame extends FlameGame
   void _startRun() {
     _run = ReplayRecorder(seed: courseSeed);
 
+    // The new run has beaten nothing yet. Cleared here rather than when the run
+    // ENDS, so the game-over card can go on reporting the run it is describing
+    // for as long as it is up.
+    _isNewBest = false;
+
+    // A pass is anchored to a frame number and a y of the run it was built for.
+    // The new run starts at frame 0 again, so the old pass would be read as
+    // advice about a moment that has not happened yet.
+    _assistPlan = null;
+    _advice = null;
+
     final Replay? best = _ghostSource;
     _ghost = best == null ? null : _ghostPlayerFor(best);
   }
@@ -590,10 +692,48 @@ class FlappyMiataGame extends FlameGame
       }
 
       _captureFinishedRun();
+      _updateAssist();
     }
 
     _panel.text = _hudText;
     _syncScreens();
+  }
+
+  /// Refreshes the flap-window advice for the frame the run has just reached.
+  ///
+  /// READ-ONLY ON THE RUN. Everything here takes `_run.model` and `_run.frame`
+  /// as arguments and returns numbers; nothing assigns to `_run`, calls `tap`,
+  /// or steps anything. That is the whole reason assist mode cannot change a
+  /// run, and it is why this method is the only place in the file that touches
+  /// the solver.
+  void _updateAssist() {
+    final AssistSolver? solver = _assist;
+    if (solver == null) {
+      _advice = null;
+      return;
+    }
+    final GameModel model = _run.model;
+    final int frame = _run.frame;
+
+    // Nothing to advise before the first tap or after the crash. Without this
+    // the last live pass would go on covering the frozen frame number and the
+    // highlight would hang over a wreck, describing a future the car does not
+    // have.
+    if (model.state != RunState.playing) {
+      _advice = null;
+      return;
+    }
+
+    // A pass covers about a second and is not invalidated by anything the
+    // player does — see `lib/ui/assist.dart` on why the surviving-state sets
+    // belong to the world rather than to the car. So this rebuilds roughly once
+    // per second, not once per frame.
+    AssistPlan? plan = _assistPlan;
+    if (plan == null || !plan.isCurrent || !plan.covers(frame)) {
+      plan = solver.plan(model, frame);
+      _assistPlan = plan;
+    }
+    _advice = plan?.adviseAt(model, frame);
   }
 
   /// Files a finished run: as the ghost for the next attempt, and — if it beat
@@ -619,6 +759,10 @@ class FlappyMiataGame extends FlameGame
     }
 
     if (!_hasBestScore || score > _bestScore) {
+      // Computed BEFORE `_bestScore` moves, because afterwards the two are
+      // equal and the question can no longer be asked. This is the only place
+      // in the program that knows what the record was a moment ago.
+      _isNewBest = score > _bestScore;
       _bestScore = score;
       _hasBestScore = true;
       // Stored as a RUN, not as a number: `lib/ui/high_score_store.dart` plays
@@ -639,7 +783,12 @@ class FlappyMiataGame extends FlameGame
   /// states that used to show them and have room to say more than three words.
   String get _hudText {
     final String score = 'score: ${_run.model.score}';
-    return _hasBestScore ? '$score\nbest: $_bestScore' : score;
+    // On its own line and never summed with the score above it. Two numbers,
+    // two questions: how far, and how close. See `lib/game/risk_score.dart`.
+    final String risk = 'risk: ${_run.model.riskScore}';
+    return _hasBestScore
+        ? '$score\n$risk\nbest: $_bestScore'
+        : '$score\n$risk';
   }
 }
 
@@ -890,6 +1039,93 @@ class _GhostLayer extends Component with HasGameReference<FlappyMiataGame> {
     final GameModel? ghost = game.ghostModel;
     if (image == null || ghost == null) return;
     _drawCar(canvas, image, ghost.carBox, game.size, _ghostPaint);
+  }
+}
+
+/// The flap-window highlight: where the car is going, and when a tap is on
+/// offer.
+///
+/// ============================================================================
+/// WHY THE PATH IS DRAWN GOING RIGHT WHEN THE CAR NEVER MOVES SIDEWAYS
+/// ============================================================================
+///
+/// The car sits at a fixed x and the world comes to it, so the car's future
+/// positions are all on one vertical line — a preview drawn there would be a
+/// stack of dots on top of each other, saying nothing about WHEN.
+///
+/// So the path is drawn in the WORLD's frame instead: the point "in d frames"
+/// goes at `carX + d * scroll * dt`, which is exactly where the car will be
+/// relative to the pipes when that frame arrives. The curve therefore reaches
+/// out toward the oncoming obstacle and lands on the gap it is going to hit,
+/// which is the picture a player already has in their head.
+///
+/// The scroll speed is read once, for the current score, and the ramp may nudge
+/// it within the preview. Over a second that is a fraction of a percent of x,
+/// and it moves only where the curve is DRAWN, never what the solver decided —
+/// so the highlight can be a hair's width out horizontally and cannot be wrong.
+class _AssistLayer extends Component with HasGameReference<FlappyMiataGame> {
+  _AssistLayer() : super(priority: _assistPriority);
+
+  /// The coasting part of the path: where the car goes if nothing is tapped.
+  static final Paint _coast = Paint()
+    ..color = const Color(0x99FFFFFF)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 2;
+
+  /// The offered window. Teal, like every other affordance in this game.
+  static final Paint _window = Paint()
+    ..color = const Color(0xE68BD3C7)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 6;
+
+  /// The last frame on which doing nothing is still survivable.
+  static final Paint _deadline = Paint()
+    ..color = const Color(0xE6FF2D78)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 3;
+
+  @override
+  void render(Canvas canvas) {
+    final AssistAdvice? advice = game.advice;
+    if (advice == null || advice.path.length < 2) return;
+
+    final Vector2 screen = game.size;
+    final double step =
+        Difficulty.scrollSpeedAt(game.model.score) * replayFrameSeconds;
+
+    Offset at(int d) => Offset(
+      (GameModel.carX + d * step) * screen.x,
+      advice.path[d] * screen.y,
+    );
+
+    // The whole coast path first, thin, so the highlight has something to sit
+    // on and the player can see where the car is headed even where no tap is
+    // offered.
+    for (int d = 0; d + 1 < advice.path.length; d++) {
+      canvas.drawLine(at(d), at(d + 1), _coast);
+    }
+
+    // Then the offered frames, thick, drawn segment by segment rather than as
+    // one span: the window is not guaranteed to be contiguous, and a single
+    // start-to-end stroke would claim taps in any hole between.
+    for (int d = 0; d + 1 < advice.path.length; d++) {
+      if (advice.flapViable[d]) {
+        canvas.drawLine(at(d), at(d + 1), _window);
+      }
+    }
+
+    // And the deadline: a short cross-stroke at the last frame doing nothing is
+    // survivable. Past this mark every continuation the search can represent is
+    // dead, so it reads as "tap before here".
+    final int last = advice.latestSafeCoast;
+    if (last >= 0 && last < advice.path.length) {
+      final Offset mark = at(last);
+      canvas.drawLine(
+        mark.translate(0, -GameModel.carHeight * screen.y),
+        mark.translate(0, GameModel.carHeight * screen.y),
+        _deadline,
+      );
+    }
   }
 }
 
