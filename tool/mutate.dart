@@ -157,6 +157,49 @@ const List<String> sandboxDirs = <String>['lib', 'test', 'tool', 'assets'];
 /// that a genuine infinite loop does not stall the run for a minute.
 const Duration defaultTimeout = Duration(seconds: 45);
 
+/// How long the output drains get AFTER the child process has already exited.
+///
+/// WHY A GRACE PERIOD IS NEEDED AT ALL, rather than either zero or infinity.
+/// `flutter test` is not one process: it spawns a `flutter_tester` grandchild
+/// that INHERITS the stdout/stderr pipes this tool reads. `proc.exitCode`
+/// completes when the direct child dies, but a pipe stays readable until every
+/// process holding its write end is gone. So a short wait after exit is normal
+/// and necessary — the last few hundred bytes of the compact reporter's output
+/// routinely arrive in that window, and those bytes are what the classifier
+/// reads.
+///
+/// WHY TEN SECONDS, AND NOT ONE, AND NOT INFINITY. Infinity is what this code
+/// used to do, and it is how the tool hung: an orphaned grandchild keeps the
+/// pipe open, the wait on the drains never completes, and nothing is covering
+/// it with a timeout because the timeout was already spent on `exitCode`. One
+/// second would be safe against that hang but would start truncating real
+/// output on a loaded CI runner, and truncated output changes verdicts — see
+/// the argument written out at the drain-stall handler in [runTests]. Ten
+/// seconds is far longer than any legitimate post-exit flush observed here and
+/// is still bounded, which is the only property that actually matters.
+const Duration drainGrace = Duration(seconds: 10);
+
+/// Default `--heartbeat=<seconds>`. `--heartbeat=0` turns the ticker off.
+///
+/// WHY FIFTEEN. The heartbeat exists to make silence impossible: the CI failure
+/// this was written for showed 26 seconds of no output followed by a SIGTERM,
+/// and nothing in the log could distinguish "the tool was working" from "the
+/// tool was hung" from "the tool was printing into a pipe nobody flushed". At
+/// 15s a four-minute CI step costs about sixteen extra lines, which is cheap
+/// enough to leave on by default and dense enough that any gap longer than one
+/// tick is visibly a gap.
+const int defaultHeartbeatSeconds = 15;
+
+/// The literal string every worker sandbox path contains.
+///
+/// WHY IT IS A NAMED CONSTANT AND NOT SPELLED OUT AT EACH USE. Two very
+/// different pieces of code depend on this exact text: [_makeSandbox], which
+/// creates the directories, and [_sweepSandboxOrphans], which decides which
+/// processes it is allowed to kill. If those two ever drifted apart the sweep
+/// would match nothing and report a confident, permanent zero — a check that
+/// cannot fail is worse than no check, because it is believed.
+const String sandboxMarker = 'flappymiata_mutate_';
+
 // =============================================================================
 // Known-equivalent mutants
 // =============================================================================
@@ -452,7 +495,8 @@ enum Verdict {
 }
 
 class MutantResult {
-  MutantResult(this.mutant, this.verdict, this.elapsed, this.detail);
+  MutantResult(this.mutant, this.verdict, this.elapsed, this.detail,
+      {this.drainStalled = false});
 
   final Mutant mutant;
   final Verdict verdict;
@@ -460,6 +504,11 @@ class MutantResult {
 
   /// First useful line of compiler or test output, for the invalid list.
   final String detail;
+
+  /// True if any test run behind this verdict lost output to a stalled drain,
+  /// so the verdict rests on possibly-truncated evidence. Reported by id in
+  /// [_printReport]; deliberately not consulted by the exit code.
+  final bool drainStalled;
 }
 
 // =============================================================================
@@ -1174,15 +1223,702 @@ List<int> _lineStarts(String src) {
 }
 
 // =============================================================================
+// Process hygiene, and being able to say why a run died
+// =============================================================================
+//
+// EVERYTHING IN THIS SECTION EXISTS TO ANSWER ONE QUESTION: when this tool
+// stops, why did it stop? The mutation verdicts were never the problem — the
+// problem was a CI job that printed seven of fifty verdicts, went silent for
+// 26 seconds, and was killed with SIGTERM while the runner reported a live
+// `dart:flutter_to` process it had to terminate as an orphan. A tool that
+// cannot say why it died forces the next person to guess, and guessing is how
+// the same failure gets "fixed" three times.
+//
+// NOTHING IN THIS SECTION MAY CHANGE A VERDICT OR AN EXIT CODE. It observes,
+// it reports, and it cleans up after itself. The one exception is deliberate
+// and documented: a SIGTERM or SIGHUP arriving mid-run exits 2, because a run
+// that was killed did not do its job and its partial score is not evidence.
+
+/// Kills [pid] and every process descended from it. Best effort. **Never
+/// throws.** Returns how many pids it actually signalled, so a caller can say
+/// something falsifiable instead of "cleaned up".
+///
+/// WHY THE WHOLE TREE AND NOT JUST THE CHILD. On Linux `flutter` is a bash
+/// script that runs a `dart` snapshot that spawns `flutter_tester`. Signalling
+/// only the direct child — which is what this code used to do — leaves two live
+/// descendants still holding the stdout pipe this tool is draining, and that is
+/// exactly the state that hangs the run. The old comment on the timeout path
+/// explicitly declined to wait for those descendants; declining to wait for
+/// them is not the same as reaping them, and only reaping them ends the hang.
+///
+/// WHY IT MUST NOT THROW, EVER. Every caller is already in trouble when it gets
+/// here: a timeout fired, or a drain stalled, or the process is being torn down
+/// by a signal. A cleanup path that throws in that moment replaces a
+/// diagnosable problem with an undiagnosable one.
+int _killTree(int pid) {
+  if (Platform.isWindows) {
+    // `/T` walks the child list itself. This is the only reliable way to do it
+    // on Windows: there is no `ps`, and the parent/child relation is not
+    // exposed anywhere a plain Dart program can read.
+    try {
+      final ProcessResult r =
+          Process.runSync('taskkill', <String>['/T', '/F', '/PID', '$pid']);
+      // taskkill prints one SUCCESS line per process it actually terminated, so
+      // the count is readable straight out of its own output. The fallback
+      // keeps the number roughly honest if that wording ever changes.
+      final int n = 'SUCCESS'.allMatches('${r.stdout}').length;
+      return n > 0 ? n : (r.exitCode == 0 ? 1 : 0);
+    } catch (_) {
+      // taskkill missing, or the pid was already gone. Either way there is
+      // nothing left to do and nothing worth failing over.
+      return 0;
+    }
+  }
+
+  // POSIX. `ps -eo pid=,ppid=` is the portable way to get the parent map:
+  // `pgrep -P` is not present everywhere, and /proc is Linux-only.
+  try {
+    final ProcessResult r = Process.runSync('ps', <String>['-eo', 'pid=,ppid=']);
+    final Map<int, List<int>> children = <int, List<int>>{};
+    for (final String line in const LineSplitter().convert('${r.stdout}')) {
+      final List<String> parts = line
+          .trim()
+          .split(RegExp(r'\s+'))
+          .where((String s) => s.isNotEmpty)
+          .toList();
+      if (parts.length < 2) {
+        continue;
+      }
+      final int? child = int.tryParse(parts[0]);
+      final int? parent = int.tryParse(parts[1]);
+      if (child == null || parent == null) {
+        continue;
+      }
+      (children[parent] ??= <int>[]).add(child);
+    }
+
+    // Breadth-first by level, so the kill can go DEEPEST-FIRST. Order is not
+    // cosmetic here: killing a parent before its children is precisely how an
+    // orphan is made, and an orphan gets reparented to init, at which point
+    // this walk can no longer find it from the pid it started with.
+    final List<List<int>> levels = <List<int>>[
+      <int>[pid],
+    ];
+    final Set<int> seen = <int>{pid};
+    while (true) {
+      final List<int> next = <int>[];
+      for (final int p in levels.last) {
+        for (final int c in children[p] ?? const <int>[]) {
+          if (seen.add(c)) {
+            next.add(c);
+          }
+        }
+      }
+      if (next.isEmpty) {
+        break;
+      }
+      levels.add(next);
+    }
+
+    int signalled = 0;
+    for (int i = levels.length - 1; i >= 0; i--) {
+      for (final int p in levels[i]) {
+        try {
+          // Verified on this machine: killPid returns false for a pid that no
+          // longer exists rather than throwing, so an already-dead descendant
+          // is a no-op and not an error.
+          if (Process.killPid(p, ProcessSignal.sigkill)) {
+            signalled++;
+          }
+        } catch (_) {
+          // Permission denied, or it exited between the listing and the
+          // signal. Both are ordinary; neither is this function's problem.
+        }
+      }
+    }
+    return signalled;
+  } catch (_) {
+    // No usable `ps` — verified: on Windows this throws ProcessException, and
+    // a stripped container image can be missing it too. Falling back to the
+    // single process is still strictly better than doing nothing.
+    try {
+      return Process.killPid(pid, ProcessSignal.sigkill) ? 1 : 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+}
+
+/// What one worker is judging right now, and when it started.
+class _InFlight {
+  _InFlight(this.mutantId, this.startedMs);
+
+  final String mutantId;
+
+  /// Milliseconds on [_RunProgress.wall] when this mutant was picked up.
+  final int startedMs;
+}
+
+/// Live state of the run, readable from anywhere in the process.
+///
+/// WHY ONE TOP-LEVEL OBJECT RATHER THAN PARAMETERS THREADED THROUGH EVERYTHING.
+/// Three unrelated places need the same answer to "what is this process doing
+/// right now": the heartbeat ticker, the signal handler that has to print a
+/// death report in whatever time it has left, and the final report. Two of
+/// those are callbacks that nothing gets to call with arguments. This is one
+/// process running one mutation run, so a single shared instance is the honest
+/// model of it rather than a shortcut around one.
+class _RunProgress {
+  /// Started once, at the top of [_run], and never reset. Every elapsed figure
+  /// the heartbeat and the death report print is measured against it, so they
+  /// cannot disagree with each other.
+  final Stopwatch wall = Stopwatch();
+
+  int total = 0;
+  int done = 0;
+
+  /// Run-level count of output drains that hit [drainGrace]. Reported loudly;
+  /// never consulted by the exit code.
+  int drainStalls = 0;
+
+  /// Worker label to what it is judging. A worker with nothing in flight is
+  /// absent from this map rather than present with a null.
+  final Map<String, _InFlight> inFlight = <String, _InFlight>{};
+
+  void begin(String worker, String id) {
+    inFlight[worker] = _InFlight(id, wall.elapsedMilliseconds);
+  }
+
+  void finish(String worker) {
+    inFlight.remove(worker);
+    done++;
+  }
+
+  /// e.g. `R014 (48s), A007 (12s)`. Empty when nothing is running.
+  ///
+  /// The AGE is the load-bearing half. `done 7/50` on its own cannot tell a
+  /// reader whether the run is progressing slowly or stopped dead; a mutant
+  /// that has been in flight for 48 seconds against a 45-second timeout can.
+  String describeInFlight() {
+    final int now = wall.elapsedMilliseconds;
+    final List<String> parts = <String>[];
+    for (final MapEntry<String, _InFlight> e in inFlight.entries) {
+      final int age = (now - e.value.startedMs) ~/ 1000;
+      parts.add('${e.value.mutantId} (${age}s)');
+    }
+    return parts.join(', ');
+  }
+}
+
+final _RunProgress _progress = _RunProgress();
+
+/// Serialized "write one line and flush it", for every line that can be
+/// printed while something else is also printing.
+///
+/// WHY THIS EXISTS, AND IT IS NOT DEFENSIVENESS — IT IS A CRASH THAT HAPPENED.
+/// `dart:io` implements `IOSink.flush()` by calling `addStream` with an empty
+/// stream, which BINDS the sink until that future completes. While a flush is
+/// in flight, ANY other `stdout.write`/`writeln` throws
+/// `StateError: StreamSink is bound to a stream`. The first version of this
+/// change flushed the heartbeat and the drain warning without awaiting them,
+/// and the very next line a worker printed blew up with that error — an
+/// unhandled exception, exit 255, no report at all. Which is a spectacular way
+/// for a change whose entire purpose is "always be able to say why you died"
+/// to invent a brand new way of dying silently.
+///
+/// So: one queue, one writer at a time, write-then-flush as an atomic unit.
+/// The queue swallows its own errors because a logging path that can throw is
+/// the thing being fixed here, not a thing to add.
+Future<void> _outTail = Future<void>.value();
+
+void _emit(String line) {
+  _outTail = _outTail.then<void>((_) async {
+    stdout.writeln(line);
+    await stdout.flush();
+  }).catchError((Object _) {});
+}
+
+/// Completes once everything queued by [_emit] has actually been written.
+/// Call this before any phase that prints with plain `stdout.writeln`, so that
+/// no queued flush is still in flight when those unserialized writes land.
+Future<void> _outIdle() async {
+  try {
+    await _outTail;
+  } catch (_) {
+    // Already swallowed inside the queue; this is belt and braces.
+  }
+}
+
+/// `mm:ss`, zero-padded, for the heartbeat and the death report.
+String _mmss(Duration d) {
+  final int secs = d.inSeconds;
+  return '${(secs ~/ 60).toString().padLeft(2, '0')}:'
+      '${(secs % 60).toString().padLeft(2, '0')}';
+}
+
+/// This process's resident set size, in whole MB, or `-` if it cannot be read.
+///
+/// `ProcessInfo.currentRss` is a cheap native call and works on every platform
+/// this tool runs on (verified on Windows; it is the same accessor on Linux).
+/// It is on the heartbeat because "the runner killed us" and "we ran out of
+/// memory" look identical from the outside, and a number that climbs across a
+/// run separates them.
+String _rssMb() {
+  try {
+    return '${ProcessInfo.currentRss ~/ (1024 * 1024)} MB';
+  } catch (_) {
+    // A heartbeat missing one field is still a heartbeat. A heartbeat that
+    // throws is silence, which is the thing this whole mechanism exists to
+    // prevent.
+    return '-';
+  }
+}
+
+/// How many processes exist on this machine right now, or `-` where that
+/// cannot be counted cheaply.
+///
+/// WHY THIS IS ON THE HEARTBEAT. The failure being chased leaks orphaned
+/// `flutter_tester` and `dart` processes. A count that climbs monotonically
+/// across a run IS that leak, visible with no extra tooling; a count that
+/// stays flat rules the leak out and points somewhere else. On Linux every
+/// process is a numeric directory under /proc, so this costs one listing.
+/// Windows has no equivalent that is cheap enough to run every 15 seconds, so
+/// it honestly prints `-` rather than a number it did not measure.
+String _processCount() {
+  if (!Platform.isLinux) {
+    return '-';
+  }
+  try {
+    int n = 0;
+    for (final FileSystemEntity e
+        in Directory('/proc').listSync(followLinks: false)) {
+      if (int.tryParse(e.path.split('/').last) != null) {
+        n++;
+      }
+    }
+    return '$n';
+  } catch (_) {
+    // /proc absent or unreadable. Not fatal, not even interesting.
+    return '-';
+  }
+}
+
+/// Returns the text after `key` on the first matching line of `/proc/meminfo`,
+/// e.g. `_procMemInfoValue('MemAvailable:')` gives `'12345678 kB'`. Null off
+/// Linux or if the file cannot be read.
+String? _procMemInfoValue(String key) {
+  try {
+    final String text = File('/proc/meminfo').readAsStringSync();
+    for (final String line in const LineSplitter().convert(text)) {
+      if (line.startsWith(key)) {
+        return line.substring(key.length).trim();
+      }
+    }
+  } catch (_) {
+    // Not Linux, or /proc is not mounted. The caller prints nothing.
+  }
+  return null;
+}
+
+/// The filesystem type backing [Directory.systemTemp], read from
+/// `/proc/mounts`. Null off Linux.
+///
+/// WHY THIS IS WORTH READING. If the system temp folder is a tmpfs, every byte
+/// of every worker sandbox — and every byte of the `.dart_tool/flutter_build`
+/// output `flutter test` regenerates inside it — is RAM, and `--jobs=N`
+/// multiplies that by N. On a hosted runner with a few GB that is a live
+/// hypothesis for the kernel or the runner killing this process, and it is
+/// invisible unless somebody prints it.
+String? _tempFsType() {
+  try {
+    final String tmp = Directory.systemTemp.path;
+    String? best;
+    int bestLen = -1;
+    for (final String line
+        in const LineSplitter().convert(File('/proc/mounts').readAsStringSync())) {
+      final List<String> f = line.split(' ');
+      if (f.length < 3) {
+        continue;
+      }
+      final String mount = f[1];
+      // Longest matching mount point wins: `/` matches everything, so a plain
+      // "starts with" would always report the root filesystem and never the
+      // tmpfs actually mounted at /tmp.
+      final bool covers =
+          tmp == mount || tmp.startsWith(mount == '/' ? '/' : '$mount/');
+      if (covers && mount.length > bestLen) {
+        bestLen = mount.length;
+        best = f[2];
+      }
+    }
+    return best;
+  } catch (_) {
+    // Not Linux, or /proc/mounts unreadable.
+    return null;
+  }
+}
+
+/// One line at the start of the run describing the machine it is running on.
+///
+/// WHY THIS EARNS ITS LINE OF OUTPUT. This tool is developed on Windows and
+/// graded on a hosted Linux runner, and both failures it has actually suffered
+/// — a hang, then a SIGTERM at two minutes — are resource-shaped. These are the
+/// facts that would tell a reader WHICH resource, and none of them can be
+/// recovered afterwards from a log that did not record them.
+void _printMachineLine() {
+  try {
+    final StringBuffer b =
+        StringBuffer('machine: ${Platform.numberOfProcessors} cores');
+    if (Platform.isLinux) {
+      final String? avail = _procMemInfoValue('MemAvailable:');
+      if (avail != null) {
+        b.write(', MemAvailable $avail');
+      }
+      final String? fs = _tempFsType();
+      b.write(', ${Directory.systemTemp.path} is ${fs ?? 'an unknown fs'}');
+    }
+    stdout.writeln(b.toString());
+  } catch (_) {
+    // Diagnostics are never allowed to be the reason a run fails.
+  }
+}
+
+/// Everything worth knowing at the moment this process is killed from outside.
+///
+/// WHY THE HANDLER PRINTS BEFORE IT DOES ANYTHING ELSE. A SIGTERM from a CI
+/// runner is the one event where there is no next session to investigate in:
+/// the process is going away, and whatever it did not say is lost. So each
+/// fact is fetched and printed independently, every one of them individually
+/// wrapped, because a diagnostic that throws while dying tells nobody anything
+/// — it just replaces the report with a stack trace about the report.
+void _printDeathReport(String signalName) {
+  // stderr is a SEPARATE sink, so it is not bound by a flush that may still be
+  // in flight on stdout (see [_emit]). This is the one report that must not
+  // lose a line to a logging mechanism, so it gets a second place to go.
+  void say(String line) {
+    try {
+      stdout.writeln(line);
+    } catch (_) {
+      try {
+        stderr.writeln(line);
+      } catch (_) {
+        // Both sinks are gone. Nothing left to try.
+      }
+    }
+  }
+
+  say('');
+  say('=' * 78);
+  say('KILLED BY $signalName after ${_mmss(_progress.wall.elapsed)} '
+      '(wall clock since the run started)');
+  say('=' * 78);
+
+  try {
+    say('  progress:  done ${_progress.done}/${_progress.total}');
+    final String busy = _progress.describeInFlight();
+    say('  in flight: ${busy.isEmpty ? '(nothing)' : busy}');
+    say('  drain stalls so far: ${_progress.drainStalls}');
+  } catch (_) {
+    say('  progress: unavailable');
+  }
+
+  try {
+    say('  rss now ${_rssMb()}, peak '
+        '${ProcessInfo.maxRss ~/ (1024 * 1024)} MB');
+  } catch (_) {
+    say('  rss: unavailable');
+  }
+
+  if (Platform.isLinux) {
+    // Memory pressure is the leading explanation for an outside kill, and
+    // these three files are the only place the kernel writes down what it
+    // thought at the time.
+    try {
+      final String? avail = _procMemInfoValue('MemAvailable:');
+      final String? swap = _procMemInfoValue('SwapFree:');
+      say('  MemAvailable ${avail ?? '?'} , SwapFree ${swap ?? '?'}');
+    } catch (_) {
+      say('  /proc/meminfo: unavailable');
+    }
+    try {
+      final File pressure = File('/proc/pressure/memory');
+      if (pressure.existsSync()) {
+        for (final String line
+            in const LineSplitter().convert(pressure.readAsStringSync())) {
+          say('  pressure/memory: $line');
+        }
+      }
+    } catch (_) {
+      say('  /proc/pressure/memory: unavailable');
+    }
+  }
+
+  if (!Platform.isWindows) {
+    // The point of this table is to NAME any orphaned `flutter_tester` or
+    // `dart` process that is still resident, with its RSS. The runner's own
+    // "Terminate orphan process" line names exactly one and truncates it; this
+    // names all of them.
+    try {
+      final ProcessResult ps = Process.runSync(
+        'ps',
+        <String>['-eo', 'pid,ppid,rss,etime,stat,comm', '--sort=-rss'],
+      );
+      say('  top processes by RSS:');
+      final List<String> lines = const LineSplitter().convert('${ps.stdout}');
+      for (final String line in lines.take(12)) {
+        say('    $line');
+      }
+    } catch (_) {
+      say('  ps: unavailable');
+    }
+  }
+
+  say('=' * 78);
+}
+
+/// Kills anything still running that references a worker sandbox, and says how
+/// many that was — **including when the answer is zero**.
+///
+/// WHY THE ZERO IS PRINTED. A sweep that only speaks when it finds something is
+/// indistinguishable from a sweep that never ran, and both look like success.
+/// `orphan sweep: 0 processes still referencing a sandbox` is the falsifiable
+/// form: it proves the sweep executed and reports what it saw.
+///
+/// WHY IT IS ONLY EVER CALLED WITH `--jobs>1`, and why that guard is not
+/// optional. In `--jobs=1` mode the working root is the REPOSITORY, so a
+/// path-matching kill would be matching on the developer's own project path and
+/// could take out their editor, their analysis server or an unrelated Flutter
+/// process. The guard is what makes "kill everything that mentions this path"
+/// a safe sentence: with `--jobs>1` every path it can match is a directory this
+/// run created under the system temp folder minutes ago.
+void _sweepSandboxOrphans() {
+  int matched = 0;
+  int signalled = 0;
+  try {
+    final Set<int> pids = _pidsReferencingSandboxes();
+    matched = pids.length;
+    for (final int p in pids) {
+      signalled += _killTree(p);
+    }
+  } catch (_) {
+    // Housekeeping does not get a vote on whether the gate is red — the same
+    // rule the sandbox teardown already follows.
+  }
+  stdout.writeln(
+    'orphan sweep: $matched processes still referencing a sandbox'
+    '${matched == 0 ? '' : ' — $signalled pids signalled'}',
+  );
+}
+
+/// This process's own pid, plus every ancestor of it.
+///
+/// WHY THE SWEEP MUST NEVER TOUCH ANY OF THESE, AND HOW THAT WAS LEARNED.
+/// Found by running the sweep for real on Windows with a decoy process: the
+/// matcher looks at COMMAND LINES, and the shell that launched this tool had
+/// the marker string in its own command line simply because the command being
+/// typed mentioned it. `taskkill /T` on that shell killed the shell and every
+/// descendant of it — including this tool, mid-run, which lost the rest of its
+/// report. Nothing about "only sweep when --jobs>1" prevents that, because
+/// that guard is about which PATHS are matchable, not about who is above us in
+/// the process tree.
+///
+/// Excluding ancestors cannot hide a real orphan: a process this run is
+/// descended from is by definition not a process this run leaked.
+///
+/// [parentOf] maps pid to parent pid. The 64-step ceiling is a cycle guard; a
+/// process tree is a tree, but this map is assembled from text produced by
+/// another program and does not get to hang the run if it is malformed.
+Set<int> _selfAndAncestors(Map<int, int> parentOf) {
+  final Set<int> out = <int>{pid};
+  int cur = pid;
+  for (int guard = 0; guard < 64; guard++) {
+    final int? parent = parentOf[cur];
+    if (parent == null || parent <= 0 || out.contains(parent)) {
+      break;
+    }
+    out.add(parent);
+    cur = parent;
+  }
+  return out;
+}
+
+/// Parent pid of [p] from `/proc/<p>/stat`, or null.
+///
+/// Field 4 of that line is the ppid, but field 2 is the executable name in
+/// parentheses and may itself contain spaces or parentheses, so the split has
+/// to start after the LAST `)` rather than at the first space. Getting this
+/// wrong would silently return a nonsense ppid, and a nonsense ppid means the
+/// ancestor guard above protects the wrong process.
+int? _ppidFromProc(int p) {
+  try {
+    final String stat = File('/proc/$p/stat').readAsStringSync();
+    final int close = stat.lastIndexOf(')');
+    if (close < 0) {
+      return null;
+    }
+    final List<String> rest = stat
+        .substring(close + 1)
+        .trim()
+        .split(RegExp(r'\s+'))
+        .where((String s) => s.isNotEmpty)
+        .toList();
+    // rest[0] is the state character; rest[1] is the ppid.
+    return rest.length < 2 ? null : int.tryParse(rest[1]);
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Every pid whose command line, or (on Linux) whose working directory, names a
+/// worker sandbox. Excludes this process and every ancestor of it. **Never
+/// throws.**
+///
+/// WHY THE WORKING DIRECTORY IS CHECKED TOO, ON LINUX, AND NOT JUST THE ARGS.
+/// This is an addition to the obvious design, and it is load-bearing. The
+/// processes in a sandboxed run are `flutter` (a bash script), the `dart`
+/// snapshot it runs, and `flutter_tester`. Only the last of those carries the
+/// sandbox path in its ARGUMENTS, via `--packages=<sandbox>/.dart_tool/...`;
+/// the other two are launched with the sandbox merely as their WORKING
+/// DIRECTORY, so an args-only sweep would silently miss both and still report
+/// a confident number. `/proc/<pid>/cwd` is a symlink that says so directly,
+/// and it is exactly as specific a marker, so it costs nothing in safety.
+Set<int> _pidsReferencingSandboxes() {
+  final Set<int> candidates = <int>{};
+  final Map<int, int> parentOf = <int, int>{};
+
+  if (Platform.isWindows) {
+    try {
+      // ONE query returns three things per process: pid, parent pid, and
+      // whether its command line names a sandbox. The parent pid is not a
+      // nicety — it is what builds the ancestor set that keeps this sweep from
+      // killing the shell it is running under.
+      //
+      // `-ne $PID` IS ALSO LOAD-BEARING AND WAS ALSO FOUND BY RUNNING IT. The
+      // marker appears in this PowerShell process's OWN command line — it is
+      // right there in the `-like` pattern — so Win32_Process matches the
+      // querying process every single time. Verified by hand with nothing else
+      // running: the query returned exactly one row, itself. Without this the
+      // sweep would report at least one orphan on every Windows run forever,
+      // and a count that can never be zero cannot be evidence of anything.
+      // The zero is the whole product here.
+      final ProcessResult r = Process.runSync('powershell', <String>[
+        '-NoProfile',
+        '-Command',
+        'Get-CimInstance Win32_Process | ForEach-Object { '
+            "'{0} {1} {2}' -f \$_.ProcessId, \$_.ParentProcessId, "
+            "\$(if (\$_.CommandLine -like '*$sandboxMarker*' "
+            '-and \$_.ProcessId -ne \$PID) { 1 } else { 0 }) }',
+      ]);
+      for (final String line in const LineSplitter().convert('${r.stdout}')) {
+        final List<String> f = line.trim().split(' ');
+        if (f.length < 3) {
+          continue;
+        }
+        final int? p = int.tryParse(f[0]);
+        final int? pp = int.tryParse(f[1]);
+        if (p == null) {
+          continue;
+        }
+        if (pp != null) {
+          parentOf[p] = pp;
+        }
+        if (f[2] == '1') {
+          candidates.add(p);
+        }
+      }
+    } catch (_) {
+      // No PowerShell, or the CIM query failed. Report nothing rather than
+      // guessing at pids — a wrong pid here is a killed process.
+    }
+  } else {
+    try {
+      // `args=` last, because it is the field that contains spaces.
+      final ProcessResult r =
+          Process.runSync('ps', <String>['-eo', 'pid=,ppid=,args=']);
+      for (final String line in const LineSplitter().convert('${r.stdout}')) {
+        final String trimmed = line.trim();
+        if (trimmed.isEmpty) {
+          continue;
+        }
+        final List<String> f = trimmed.split(RegExp(r'\s+'));
+        if (f.length < 2) {
+          continue;
+        }
+        final int? p = int.tryParse(f[0]);
+        final int? pp = int.tryParse(f[1]);
+        if (p == null) {
+          continue;
+        }
+        if (pp != null) {
+          parentOf[p] = pp;
+        }
+        // `ps`'s own command line is `ps -eo pid=,ppid=,args=`, which does not
+        // contain the marker, so there is no self-match to exclude here the
+        // way there is on Windows.
+        if (trimmed.contains(sandboxMarker)) {
+          candidates.add(p);
+        }
+      }
+    } catch (_) {
+      // No `ps`. The /proc pass below may still find them.
+    }
+  }
+
+  if (Platform.isLinux) {
+    // Fill any gaps in the parent map straight from /proc, so the ancestor
+    // guard still works on a machine with no `ps` at all.
+    int cur = pid;
+    for (int guard = 0; guard < 64 && !parentOf.containsKey(cur); guard++) {
+      final int? pp = _ppidFromProc(cur);
+      if (pp == null || pp <= 0) {
+        break;
+      }
+      parentOf[cur] = pp;
+      cur = pp;
+    }
+
+    try {
+      for (final FileSystemEntity e
+          in Directory('/proc').listSync(followLinks: false)) {
+        final int? p = int.tryParse(e.path.split('/').last);
+        if (p == null) {
+          continue;
+        }
+        try {
+          final String cwd = Link('/proc/$p/cwd').resolveSymbolicLinksSync();
+          if (cwd.contains(sandboxMarker)) {
+            candidates.add(p);
+          }
+        } catch (_) {
+          // Another user's process, or one that exited between the listing
+          // and the readlink. Both are ordinary.
+        }
+      }
+    } catch (_) {
+      // /proc unreadable.
+    }
+  }
+
+  // The last word belongs to the ancestor guard, applied to everything both
+  // passes found. See [_selfAndAncestors] for what happened without it.
+  return candidates.difference(_selfAndAncestors(parentOf));
+}
+
+// =============================================================================
 // Test running
 // =============================================================================
 
 class TestRun {
-  TestRun(this.verdict, this.detail, this.elapsed);
+  TestRun(this.verdict, this.detail, this.elapsed, {this.drainStalled = false});
 
   final Verdict verdict;
   final String detail;
   final Duration elapsed;
+
+  /// True if the output drains were still open [drainGrace] after the child
+  /// exited, i.e. this run's output may be TRUNCATED. Carried through to the
+  /// report rather than acted on — see the argument in [runTests].
+  final bool drainStalled;
 }
 
 /// Runs `flutter test` over [testPaths] (empty means the whole suite) and
@@ -1215,15 +1951,71 @@ Future<TestRun> runTests(
 
   int? exitCode;
   bool timedOut = false;
+  bool drainStalled = false;
   try {
     exitCode = await proc.exitCode.timeout(timeout);
-    await Future.wait(<Future<void>>[outDone, errDone]);
+
+    // THE DRAIN IS BOUNDED. This line used to be an unconditional
+    // `await Future.wait([outDone, errDone])` with no ceiling on it, and that
+    // is the defect that hung this tool. The `.timeout` above is spent on
+    // `exitCode`, so once the direct child has exited there was nothing left
+    // covering the wait: if a `flutter_tester` grandchild still held the write
+    // end of these pipes, neither future would ever complete and the run
+    // stopped here, silently, forever.
+    try {
+      await Future.wait(<Future<void>>[outDone, errDone]).timeout(drainGrace);
+    } on TimeoutException {
+      drainStalled = true;
+      _progress.drainStalls++;
+      final int reaped = _killTree(proc.pid);
+
+      // WHY THIS IS SAFE TO CARRY ON FROM, WHICH IS THE PART THAT MATTERS.
+      //
+      // Truncated output can only ever move a run TOWARDS `UNRECOGNISED` and
+      // therefore towards `Verdict.invalid`. It can never manufacture a free
+      // kill, because the killed branch below requires either the literal
+      // string `Some tests failed.` in the output or a non-zero exit code, and
+      // losing bytes cannot add either of those. `invalid` is excluded from
+      // BOTH sides of the score and every invalid mutant is printed by id in
+      // the report, so a misfiled run is loud rather than flattering. That is
+      // the safe direction to fail in, and it is why this does not throw.
+      //
+      // THE COST, STATED PLAINLY: a genuine SURVIVOR whose output was
+      // truncated here would be misfiled as INVALID, which means a real hole
+      // in the test suite could be hidden by this path. That is exactly why
+      // the grace is ten seconds rather than one, and why the stall is
+      // counted, warned about at the moment it happens, and reported at the
+      // end with the mutant ids attached. A silent version of this would be
+      // a way of quietly losing findings.
+      _emit(
+        'WARNING: output drain still open ${drainGrace.inSeconds}s after the '
+        'child exited — a grandchild is holding the pipe. Reaped $reaped '
+        'pid(s); classifying only the output buffered so far, which can turn '
+        'a real SURVIVOR into an INVALID.',
+      );
+    }
   } on TimeoutException {
     timedOut = true;
-    proc.kill(ProcessSignal.sigkill);
-    // Do not await the stream drains here: the child may have grandchildren
-    // holding the pipe open, and waiting on them would hang the very run the
-    // timeout exists to unblock.
+    // The whole tree, not just the direct child. `flutter` on Linux is a bash
+    // script running a `dart` snapshot that spawns `flutter_tester`; killing
+    // the script left both descendants alive and holding this pipe.
+    final int reaped = _killTree(proc.pid);
+
+    // Now that the tree is dead the drains CAN be waited on, and they should
+    // be: a pending stream subscription is one of the things that keeps a Dart
+    // VM resident after everything useful is finished (see the note in
+    // `main`). Bounded, because this is the path that exists to unblock a run
+    // and it must not become a second way to hang.
+    try {
+      await Future.wait(<Future<void>>[outDone, errDone]).timeout(drainGrace);
+    } on TimeoutException {
+      drainStalled = true;
+      _progress.drainStalls++;
+      _emit(
+        'WARNING: pipes still open ${drainGrace.inSeconds}s after killing the '
+        'timed-out process tree ($reaped pid(s) signalled).',
+      );
+    }
   }
   sw.stop();
 
@@ -1234,6 +2026,7 @@ Future<TestRun> runTests(
       Verdict.killedByTimeout,
       'no result within ${timeout.inSeconds}s',
       sw.elapsed,
+      drainStalled: drainStalled,
     );
   }
 
@@ -1241,15 +2034,18 @@ Future<TestRun> runTests(
   if (output.contains('Compilation failed for testPath=') ||
       output.contains('Error: The Dart compiler exited unexpectedly') ||
       (output.contains('Failed to load "') && output.contains(': Error: '))) {
-    return TestRun(Verdict.invalid, _firstCompilerError(output), sw.elapsed);
+    return TestRun(Verdict.invalid, _firstCompilerError(output), sw.elapsed,
+        drainStalled: drainStalled);
   }
 
   if (exitCode == 0 && output.contains('All tests passed!')) {
-    return TestRun(Verdict.survived, '', sw.elapsed);
+    return TestRun(Verdict.survived, '', sw.elapsed,
+        drainStalled: drainStalled);
   }
 
   if (output.contains('Some tests failed.') || (exitCode ?? 1) != 0) {
-    return TestRun(Verdict.killed, _firstFailure(output), sw.elapsed);
+    return TestRun(Verdict.killed, _firstFailure(output), sw.elapsed,
+        drainStalled: drainStalled);
   }
 
   // Neither shape. Refusing to guess is the point: an unrecognised outcome
@@ -1257,8 +2053,12 @@ Future<TestRun> runTests(
   // anything.
   return TestRun(
     Verdict.invalid,
-    'UNRECOGNISED test output (exit $exitCode)',
+    drainStalled
+        ? 'UNRECOGNISED test output (exit $exitCode; output TRUNCATED by a '
+            'stalled drain — this may be a hidden survivor)'
+        : 'UNRECOGNISED test output (exit $exitCode)',
     sw.elapsed,
+    drainStalled: drainStalled,
   );
 }
 
@@ -1408,12 +2208,22 @@ Future<void> main(List<String> args) async {
   // nothing, and the report it already printed scrolls past unread. By this
   // point every verdict is computed, printed and flushed, so there is nothing
   // left for the event loop to do that anyone is waiting for.
+  // Drain the serialized queue BEFORE the final flush: `exit` is immediate and
+  // does not wait for pending microtasks, so anything still sitting in the
+  // queue at this point would simply never be printed.
+  await _outIdle();
   await stdout.flush();
   exit(status);
 }
 
 Future<int> _run(List<String> args) async {
   final Map<String, String> opts = _parseArgs(args);
+
+  // Started before anything else so that every elapsed figure printed by the
+  // heartbeat and by the death report is measured from the same instant, and
+  // so that a run killed during generation still reports a real elapsed time
+  // rather than zero.
+  _progress.wall.start();
 
   final String repoRoot = opts['root'] ?? Directory.current.path;
   final String flutterCmd = _resolveFlutter(opts['flutter']);
@@ -1424,6 +2234,8 @@ Future<int> _run(List<String> args) async {
   final bool listOnly = opts.containsKey('list');
   final bool selftest = opts.containsKey('selftest');
   final Set<String>? only = opts['only']?.split(',').toSet();
+  final int heartbeatSeconds =
+      int.parse(opts['heartbeat'] ?? '$defaultHeartbeatSeconds');
 
   // ---- read the originals, once, as bytes --------------------------------
   final Map<String, Uint8List> originalBytes = <String, Uint8List>{};
@@ -1457,6 +2269,83 @@ Future<int> _run(List<String> args) async {
     exit(130);
   });
 
+  /// Last words. Print first, restore second, leave third.
+  ///
+  /// WHY THE EXIT CODE IS 2 AND NOT 1. The contract at the bottom of this
+  /// function is that the number means something a reader would act on: 1 says
+  /// "the tool worked and found a real hole", 2 says "the tool could not do
+  /// its job, so no score it printed is evidence". A run that was killed from
+  /// outside at 7 of 50 mutants is squarely the second thing. Returning 1
+  /// would send somebody hunting for a survivor that was never measured.
+  // Declared before `dieOnSignal` so the signal handler can stop the ticker
+  // before it prints, and before the `try` so the `finally` can cancel it on
+  // every return path. A live periodic timer is exactly the kind of thing that
+  // keeps a Dart VM alive after all the useful work is done, which is the
+  // failure this tool has already been bitten by once.
+  Timer? heartbeat;
+
+  // A runner that wants a process gone often sends SIGTERM and then SIGHUP.
+  // Without this latch both handlers would run and the two death reports would
+  // interleave line by line, turning the one piece of evidence this path exists
+  // to produce into something nobody can read.
+  bool dying = false;
+  Future<void> dieOnSignal(String signalName) async {
+    if (dying) {
+      return;
+    }
+    dying = true;
+    // Silence the ticker first: a heartbeat line interleaved into the death
+    // report, or a queued flush landing mid-report, is exactly the noise this
+    // report cannot afford.
+    heartbeat?.cancel();
+    heartbeat = null;
+    _printDeathReport(signalName);
+    try {
+      restoreAll();
+      stdout.writeln('lib/game restored.');
+    } catch (_) {
+      try {
+        stdout.writeln('WARNING: could not restore lib/game while dying — '
+            'check the working tree before committing.');
+      } catch (_) {
+        // stdout is gone too. Nothing left to say it with.
+      }
+    }
+    try {
+      await stdout.flush();
+    } catch (_) {
+      // Nothing further to try; we are leaving either way.
+    }
+    exit(2);
+  }
+
+  // SIGTERM and SIGHUP: the two ways a CI runner ends a job it has decided to
+  // stop. The observed failure was exit code 143, which is 128 + 15, which is
+  // SIGTERM — and the log said nothing else at all. Catching it turns "the
+  // step died" into a report naming what was in flight and what the machine
+  // looked like at that instant.
+  //
+  // WHY THIS IS GUARDED BY `!Platform.isWindows` EVEN THOUGH IT DOES NOT HAVE
+  // TO BE. Checked against the Dart 3.13.2 SDK source and confirmed by running
+  // it: `ProcessSignal.sigterm.watch()` and `sighup.watch()` do NOT throw on
+  // Windows — the SDK's own guard permits sighup, sigint and sigterm on every
+  // platform. The guard is here for a different and better reason: everything
+  // the handler prints that is worth printing (`ps`, /proc/meminfo,
+  // /proc/pressure/memory) is POSIX-only, and a Windows SIGTERM is a synthetic
+  // console event that this tool is never actually killed by. Registering a
+  // handler that could only print a header would be noise pretending to be
+  // coverage.
+  StreamSubscription<ProcessSignal>? sigterm;
+  StreamSubscription<ProcessSignal>? sighup;
+  if (!Platform.isWindows) {
+    sigterm = ProcessSignal.sigterm
+        .watch()
+        .listen((_) => unawaited(dieOnSignal('SIGTERM')));
+    sighup = ProcessSignal.sighup
+        .watch()
+        .listen((_) => unawaited(dieOnSignal('SIGHUP')));
+  }
+
   try {
     // ---- generate -------------------------------------------------------
     final List<Mutant> all = <Mutant>[];
@@ -1482,6 +2371,21 @@ Future<int> _run(List<String> args) async {
     }
 
     _printHeader(all, quick, timeout, int.parse(opts['jobs'] ?? '1'));
+    _printMachineLine();
+    stdout.writeln('');
+
+    // FLUSH THE HEADER EXPLICITLY, and after every line printed below that a
+    // reader would use to locate a failure in time.
+    //
+    // WHY THIS IS NOT SUPERSTITION. GitHub Actions captures a step's stdout
+    // through a PIPE, and a pipe is block-buffered rather than line-buffered.
+    // A process killed with buffered lines still pending loses them entirely,
+    // and lost output is indistinguishable in the log from output that was
+    // never produced. The CI failure this was written for showed 26 seconds of
+    // silence before a SIGTERM; some of that "silence" may simply be lines
+    // that existed and never reached the runner. Flushing costs nothing and
+    // rules the explanation in or out instead of leaving it open.
+    await stdout.flush();
 
     if (listOnly) {
       for (final Mutant m in all) {
@@ -1490,7 +2394,28 @@ Future<int> _run(List<String> args) async {
       return 0;
     }
 
+    // ---- heartbeat -------------------------------------------------------
+    // WHY A TIMER AND NOT A PRINT AT THE TOP OF EACH WORKER ITERATION. A
+    // per-iteration print can only speak when an iteration ENDS, which is
+    // precisely the thing that stops happening when a run wedges. The whole
+    // value of this line is that it fires while every worker is busy, so the
+    // gaps get covered rather than the moments that were never in doubt.
+    if (heartbeatSeconds > 0) {
+      heartbeat = Timer.periodic(Duration(seconds: heartbeatSeconds), (Timer _) {
+        final String busy = _progress.describeInFlight();
+        _emit(
+          '[hb] +${_mmss(_progress.wall.elapsed)}  '
+          'done ${_progress.done}/${_progress.total}  '
+          'rss ${_rssMb()}  procs ${_processCount()}'
+          '${busy.isEmpty ? '' : '  inflight: $busy'}',
+        );
+      });
+    }
+
     if (selftest) {
+      // Three controls, so the heartbeat's `done N/total` means something
+      // during the self-test too rather than reading `0/0` for its duration.
+      _progress.total = 3;
       final bool ok = await _runSelfTest(
         flutterCmd,
         repoRoot,
@@ -1566,14 +2491,18 @@ Future<int> _run(List<String> args) async {
     }
 
     int nextIndex = 0;
-    int done = 0;
+    _progress.total = toRun.length;
     Future<void> worker(String root) async {
+      // Stable label so the heartbeat can name which worker is stuck, not just
+      // that something is.
+      final String label = 'w${roots.indexOf(root)}';
       while (true) {
         final int i = nextIndex++;
         if (i >= toRun.length) {
           return;
         }
         final Mutant m = toRun[i];
+        _progress.begin(label, m.id);
         final MutantResult r = await _judge(
           flutterCmd,
           root,
@@ -1582,18 +2511,47 @@ Future<int> _run(List<String> args) async {
           originalBytes,
           timeout,
         );
+        _progress.finish(label);
         results.add(r);
-        done++;
-        stdout.writeln(
-          '[${done.toString().padLeft(4)}/${toRun.length}] '
+        // See the flush argument at the header: a verdict line that never left
+        // the buffer is a verdict nobody can prove was computed. [_emit]
+        // rather than a bare writeln+flush because the heartbeat and the other
+        // workers are printing at the same time.
+        _emit(
+          '[${_progress.done.toString().padLeft(4)}/${toRun.length}] '
           '${m.id.padRight(8)}${_verdictLabel(r.verdict).padRight(12)}'
           '${m.describe()}',
         );
+        await _outIdle();
       }
     }
 
     await Future.wait(roots.map(worker));
     wall.stop();
+
+    // The ticker stops HERE, not in the `finally`, and the output queue is
+    // drained before anything else prints. Everything from this point on —
+    // the sweep, the hash proof, the report — writes with plain
+    // `stdout.writeln`, and those writes are only safe once no queued flush
+    // can still be in flight. See [_emit] for what happens when they are not.
+    heartbeat?.cancel();
+    heartbeat = null;
+    await _outIdle();
+
+    // ---- orphan sweep ----------------------------------------------------
+    // Run here, after the last verdict and BEFORE the sandbox deletes, because
+    // a process still holding a handle inside a sandbox is the documented
+    // reason those deletes fail on Windows — and, on Linux, the reason the
+    // whole tool can outlive its own report.
+    if (jobs > 1) {
+      _sweepSandboxOrphans();
+    } else {
+      // Said out loud rather than skipped silently. "No line" and "zero
+      // orphans" must not look the same to a reader.
+      stdout.writeln('orphan sweep: skipped — only safe with --jobs>1, where '
+          'every matchable path is a sandbox this run created');
+    }
+    await stdout.flush();
 
     // ---- verify every tree is exactly as we found it ---------------------
     // Including the sandboxes: a worker that failed to restore its own copy
@@ -1633,6 +2591,7 @@ Future<int> _run(List<String> args) async {
       wall: wall.elapsed,
       quick: quick,
       teardownWarnings: teardownWarnings,
+      drainStalls: _progress.drainStalls,
     );
 
     // THE EXIT CODE REFLECTS THE VERDICTS AND NOTHING ELSE.
@@ -1656,8 +2615,15 @@ Future<int> _run(List<String> args) async {
         results.where((MutantResult r) => r.verdict == Verdict.survived).length;
     return survivors == 0 ? 0 : 1;
   } finally {
+    // The ticker is cancelled FIRST and unconditionally. A live periodic timer
+    // is a pending event-loop task, and a pending event-loop task is one of
+    // the things that can keep this VM resident after the report is printed —
+    // the exact shape of failure documented in `main`.
+    heartbeat?.cancel();
     restoreAll();
     await sigint.cancel();
+    await sigterm?.cancel();
+    await sighup?.cancel();
   }
 }
 
@@ -1678,13 +2644,21 @@ Future<MutantResult> _judge(
   // suite. Re-run everything before calling anything a survivor.
   if (run.verdict == Verdict.survived) {
     final TestRun full = await runTests(flutterCmd, root, tier2Tests, timeout);
-    run = TestRun(full.verdict, full.detail, run.elapsed + full.elapsed);
+    // A stall in EITHER tier taints the verdict, so the flag is OR-ed rather
+    // than overwritten by the later run.
+    run = TestRun(
+      full.verdict,
+      full.detail,
+      run.elapsed + full.elapsed,
+      drainStalled: run.drainStalled || full.drainStalled,
+    );
   }
 
   for (final String rel in targetFiles) {
     _writeWithRetry(File('$root/$rel'), originalBytes[rel]!);
   }
-  return MutantResult(m, run.verdict, run.elapsed, run.detail);
+  return MutantResult(m, run.verdict, run.elapsed, run.detail,
+      drainStalled: run.drainStalled);
 }
 
 /// Creates worker sandbox [i]: a minimal copy of the package that `flutter
@@ -1704,11 +2678,13 @@ Future<MutantResult> _judge(
 /// fresh uniquely-named directory is used instead of the preferred one. A
 /// second-choice path costs nothing; a dead run costs the whole diagnosis.
 String _makeSandbox(String repoRoot, int i) {
-  final String preferred = '${Directory.systemTemp.path}/flappymiata_mutate_$i';
+  // Both spellings go through [sandboxMarker] so the orphan sweep's matcher
+  // and the directory names it matches on can never drift apart.
+  final String preferred = '${Directory.systemTemp.path}/$sandboxMarker$i';
   Directory dir = Directory(preferred);
   if (dir.existsSync() && _deleteDirWithRetry(dir) != null) {
-    dir = Directory.systemTemp.createTempSync('flappymiata_mutate_${i}_');
-    stdout.writeln('note: could not clear $preferred (something still holds a '
+    dir = Directory.systemTemp.createTempSync('$sandboxMarker${i}_');
+    _emit('note: could not clear $preferred (something still holds a '
         'handle in it); worker $i will use ${dir.path} instead');
   }
   dir.createSync(recursive: true);
@@ -2059,69 +3035,83 @@ Future<bool> _runSelfTest(
 
   final String src = originalText[file]!;
   if (!src.contains(gravityDecl)) {
-    stdout.writeln('FATAL: selftest anchor not found: $gravityDecl');
+    _emit('FATAL: selftest anchor not found: $gravityDecl');
+    await _outIdle();
     return false;
   }
   // Checked explicitly, because a missing judge would otherwise show up as
   // `NEGATIVE => KILLED` — a failure that reads like "the control broke" when
   // the real cause is "the file is not there".
   if (!File('$repoRoot/$negativeControlTest').existsSync()) {
-    stdout.writeln('FATAL: negative control judge not found: '
+    _emit('FATAL: negative control judge not found: '
         '$negativeControlTest');
+    await _outIdle();
     return false;
   }
 
-  Future<TestRun> withSource(String replacement, List<String> tests) async {
+  // `label` is only for the heartbeat and the death report: it is what appears
+  // as the in-flight item so a self-test that wedges says WHICH control it
+  // wedged on, which is the difference between a bug report and a shrug.
+  Future<TestRun> withSource(
+    String label,
+    String replacement,
+    List<String> tests,
+  ) async {
+    _progress.begin('selftest', label);
     File('$repoRoot/$file')
         .writeAsStringSync(src.replaceFirst(gravityDecl, replacement), flush: true);
     final TestRun r = await runTests(flutterCmd, repoRoot, tests, timeout);
     restoreAll();
+    _progress.finish('selftest');
     return r;
   }
 
-  stdout.writeln('');
-  stdout.writeln('=== SELF-TEST: can the tool produce all three verdicts? ===');
-  stdout.writeln('');
+  _emit('');
+  _emit('=== SELF-TEST: can the tool produce all three verdicts? ===');
+  _emit('');
 
-  final TestRun positive = await withSource(gravityBroken, tier1Tests);
-  stdout.writeln(
+  final TestRun positive =
+      await withSource('POSITIVE', gravityBroken, tier1Tests);
+  _emit(
     'POSITIVE  gravity 2.2 -> 22.0, judged by tier 1        '
     '=> ${_verdictLabel(positive.verdict)}   (want KILLED)',
   );
   if (positive.detail.isNotEmpty) {
-    stdout.writeln('          ${positive.detail}');
+    _emit('          ${positive.detail}');
   }
 
-  final TestRun negative =
-      await withSource(gravityBroken, <String>[negativeControlTest]);
-  stdout.writeln(
+  final TestRun negative = await withSource(
+      'NEGATIVE', gravityBroken, <String>[negativeControlTest]);
+  _emit(
     'NEGATIVE  the same edit, judged by the blind test only '
     '=> ${_verdictLabel(negative.verdict)}   (want SURVIVED)',
   );
-  stdout.writeln('          judge: $negativeControlTest — compiles the mutated '
+  _emit('          judge: $negativeControlTest — compiles the mutated '
       'file, cannot observe gravity');
   if (negative.verdict != Verdict.survived && negative.detail.isNotEmpty) {
-    stdout.writeln('          ${negative.detail}');
+    _emit('          ${negative.detail}');
   }
 
-  final TestRun invalid = await withSource(syntaxBroken, tier1Tests);
-  stdout.writeln(
+  final TestRun invalid =
+      await withSource('INVALID', syntaxBroken, tier1Tests);
+  _emit(
     'INVALID   `2.2 &&&`, judged by tier 1                  '
     '=> ${_verdictLabel(invalid.verdict)}    (want INVALID)',
   );
   if (invalid.detail.isNotEmpty) {
-    stdout.writeln('          ${invalid.detail}');
+    _emit('          ${invalid.detail}');
   }
 
   final bool ok = positive.verdict == Verdict.killed &&
       negative.verdict == Verdict.survived &&
       invalid.verdict == Verdict.invalid;
 
-  stdout.writeln('');
-  stdout.writeln(ok
+  _emit('');
+  _emit(ok
       ? 'SELF-TEST PASSED — the classifier is capable of all three verdicts, so '
           'a KILLED is a real observation and not a default.'
       : 'SELF-TEST FAILED — do not trust any score this tool prints.');
+  await _outIdle();
   return ok;
 }
 
@@ -2176,6 +3166,7 @@ void _printReport({
   required Duration wall,
   required bool quick,
   required List<String> teardownWarnings,
+  required int drainStalls,
 }) {
   int count(Verdict v) =>
       results.where((MutantResult r) => r.verdict == v).length;
@@ -2208,6 +3199,24 @@ void _printReport({
   stdout.writeln('    of which by timeout     ${timeouts.toString().padLeft(5)}   '
       'weaker evidence: "did not finish", not "asserted wrong"');
   stdout.writeln('  SURVIVED                  ${survived.toString().padLeft(5)}');
+
+  // Printed only when it happened, but never suppressed when it did. A stalled
+  // drain means at least one verdict on this page rests on output that was
+  // cut off, and the direction that truncation pushes a verdict — towards
+  // INVALID — is also the direction that HIDES a survivor. This line is the
+  // only warning a reader gets that the score below might be missing a hole.
+  if (drainStalls > 0) {
+    stdout.writeln('  output drains that stalled${drainStalls.toString().padLeft(5)}   '
+        'a grandchild held the pipe open; see the warnings above');
+    final List<MutantResult> affected =
+        results.where((MutantResult r) => r.drainStalled).toList();
+    if (affected.isNotEmpty) {
+      stdout.writeln('    affected mutants: '
+          '${affected.map((MutantResult r) => r.mutant.id).join(', ')}');
+      stdout.writeln('    treat any INVALID among these as an unproven '
+          'verdict, not as a compile failure');
+    }
+  }
   stdout.writeln('');
   stdout.writeln('  mutation score  $killed / $denominator = '
       '${score.toStringAsFixed(1)}%');

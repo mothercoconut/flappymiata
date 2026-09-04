@@ -347,6 +347,177 @@ jobs:
         # before it starts.
         run: flutter pub get
 
+      # =======================================================================
+      # DIAGNOSTICS — added after this job died with exit code 143
+      # =======================================================================
+      #
+      # WHAT HAPPENED, so the next person reading this knows why three steps in
+      # this job print numbers instead of proving something.
+      #
+      # On a `ubuntu-latest` runner this job's last step — the `--quick` one at
+      # the bottom of the file — was killed two minutes and two seconds after it
+      # started, having scored seven of its fifty-two mutants. The runner logged
+      #
+      #     ##[error]Process completed with exit code 143.
+      #     Terminate orphan process: pid (3804) (dart:flutter_to)
+      #
+      # 143 is 128 + 15, which is the shell's way of saying the process was
+      # ended by SIGTERM. Four things that would explain it were checked and
+      # all four are ruled out: the job's `timeout-minutes` is 45 and this died
+      # at 2m02s; the run's conclusion was "failure" and not "cancelled", so the
+      # `concurrency` block above did not supersede it; the `--selftest` step
+      # immediately before it passed on the same machine seconds earlier; and
+      # the identical command passes on the development laptop. The other four
+      # jobs in this workflow all went green on the same commit.
+      #
+      # The informative part of that log is not the error line, it is the two
+      # silences around it: a 34-second gap between mutants 6 and 7 in a step
+      # where the other gaps were 5 or 6 seconds, and then 26 seconds of nothing
+      # at all before the kill. Nothing in the log explains either.
+      #
+      # WHY THE ANSWER IS INSTRUMENTATION AND NOT A SETTING CHANGE.
+      # A bare 143 is consistent with at least four different stories — the
+      # machine ran out of memory, the machine ran out of disk, the tool leaked
+      # worker processes until something upstream intervened, or the hosted
+      # runner itself was evicted — and there is currently no way to tell them
+      # apart from the log. The cheapest thing that discriminates between them
+      # is to write down what the machine looked like while it was dying, so the
+      # NEXT failure is diagnosed by reading rather than by guessing. That is
+      # all the three steps below do. They prove nothing and they gate nothing.
+      #
+      # THE RULE ABOUT `continue-on-error`, stated once here and true everywhere
+      # in this job: it appears ONLY on steps that observe, and never on either
+      # `dart run` step. A diagnostic that can turn a red gate green would be
+      # worse than no diagnostic, because it would quietly convert this job from
+      # a gate into a log. Note also that `continue-on-error` is per-step and
+      # does not leak: the post-mortem step below carries both
+      # `continue-on-error: true` and `if: always()`, and neither of those stops
+      # a failed `--quick` step from failing the job. The job's conclusion is
+      # still decided by the two `dart run` steps and nothing else.
+
+      - name: Pre-flight - what machine did we actually get
+        # Runners are not identical and the log never says which one you got.
+        # This prints the shape of the machine BEFORE any Dart process starts,
+        # so the numbers the sampler prints later have a baseline to be read
+        # against. Everything here is a read; nothing is configured or changed.
+        continue-on-error: true
+        run: |
+          echo "----- cpu -----"
+          nproc || true
+          echo "----- memory -----"
+          free -m || true
+          echo "----- disk -----"
+          df -h / || true
+          df -h /tmp || true
+          echo "----- what filesystem is /tmp on -----"
+          # THIS IS THE ONE TO READ FIRST, and it is the reason this step exists
+          # at all. `tool/mutate.dart` builds each worker sandbox under
+          # `Directory.systemTemp`, which on Linux is /tmp. If /tmp turns out to
+          # be a tmpfs, then every sandbox — and every `.dart_tool/flutter_build`
+          # tree that `flutter test` regenerates inside one, which the tool's own
+          # comments put at 185 MB apiece — is charged against RAM rather than
+          # against disk. Two workers doing that at once, on top of two live
+          # `flutter test` processes, is a complete and self-contained
+          # explanation for the machine running out of memory, and it would be
+          # invisible in `df -h /`. If the FSTYPE column below says `tmpfs`,
+          # that is the lead. If it says `ext4` or `overlay`, that hypothesis is
+          # dead and the sampler's numbers are where to look instead.
+          findmnt -T /tmp || true
+          echo "----- swap (no output here means there is none) -----"
+          # An empty result is the answer, not a missing answer. With no swap, a
+          # memory squeeze has nowhere to go but the OOM killer, and processes
+          # die instead of merely getting slow. Hosted runners historically ship
+          # with a swapfile; whether this one did is worth knowing.
+          swapon --show || true
+          echo "----- ceilings -----"
+          # Process and file-descriptor limits. `flutter test` opens a lot of
+          # both, and two workers double it. If the tool were leaking processes,
+          # `ulimit -u` is the wall it would eventually hit — and hitting it
+          # produces failures that look nothing like a memory problem.
+          echo "max user processes: $(ulimit -u)"
+          echo "open files:         $(ulimit -n)"
+          echo "----- processes already running -----"
+          # Counts the header row too, so this reads exactly one higher than the
+          # `procs=` field the sampler prints below. Worth knowing before
+          # somebody spends ten minutes on a one-process discrepancy that is an
+          # artefact of `ps` printing a header here and not there.
+          ps -e | wc -l || true
+          echo "----- kernel pressure stall information -----"
+          # PSI, if the kernel exposes it. These are the percentage of the last
+          # 10/60/300 seconds during which work was stalled waiting for memory,
+          # I/O or CPU. Near-zero here is the clean baseline that makes a
+          # non-zero figure in the sampler's output meaningful later.
+          cat /proc/pressure/memory /proc/pressure/io /proc/pressure/cpu 2>/dev/null || \
+            echo "no /proc/pressure — this kernel has PSI disabled"
+
+      - name: Start the background resource sampler
+        # WHY A SAMPLER AND NOT MORE PRINTING INSIDE THE TOOL.
+        # A process that is about to be killed cannot report its own death, and
+        # a step that is killed cannot print a summary. So the observer has to
+        # live outside the thing being observed, and it has to write to DISK
+        # rather than to the step's stdout — because a file that is already on
+        # disk survives a SIGTERM that the step never gets to handle. The step
+        # that reads the file back is a separate, later step, which is what
+        # makes the whole arrangement work at all.
+        #
+        # WHY IT IS DETACHED THREE DIFFERENT WAYS.
+        # The runner reaps processes that a step leaves behind — the
+        # `Terminate orphan process` line in the failing log is that mechanism
+        # firing. It finds them by looking for a tracking id in the process
+        # environment, so a sampler that inherited that id could be reaped at
+        # the end of the step that started it, and would then be dead for the
+        # whole of the run it was supposed to watch. `env -u` strips the id,
+        # `setsid -f` puts the sampler in its own session so it is not in the
+        # step's process group, and the log file means that even if all of that
+        # fails the samples taken up to that point are still on disk. The
+        # `first samples` printed below are the check: if they are there, the
+        # sampler started, and the post-mortem step will say how many lines it
+        # managed to write.
+        continue-on-error: true
+        run: |
+          cat > /tmp/ci-sampler.sh <<'SAMPLER'
+          #!/usr/bin/env bash
+          # One line every three seconds. Cheap on purpose — this runs on every
+          # push, so the sampler forks exactly one `ps` per tick and reads the
+          # rest straight out of /proc.
+          echo $$ > /tmp/ci-sampler.pid
+          i=0
+          # A hard ceiling of 1200 ticks (~60 min) so a sampler that is somehow
+          # never killed still stops on its own rather than spinning for the
+          # life of the machine.
+          while [ "$i" -lt 1200 ]; do
+            i=$((i + 1))
+            ts=$(date -u +%H:%M:%S)
+            memav=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+            swapfree=$(awk '/^SwapFree:/{print $2}' /proc/meminfo)
+            load1=$(cut -d' ' -f1 /proc/loadavg)
+            psout=$(ps -e -o rss=,comm=)
+            procs=$(printf '%s\n' "$psout" | wc -l)
+            # dartprocs is the orphan-leak counter: how many flutter/dart/test
+            # processes exist right now, and how much resident memory they hold
+            # between them. A number that climbs mutant over mutant instead of
+            # returning to its floor is a leak, observed rather than suspected.
+            pair=$(printf '%s\n' "$psout" | awk '/flutter|dart|_tester/ {n++; r+=$1} END {printf "%d %d", n+0, r+0}')
+            dartn=${pair% *}
+            dartrss=${pair#* }
+            psi=na
+            if [ -r /proc/pressure/memory ]; then
+              psi=$(awk '/^some/{print $2}' /proc/pressure/memory)
+              psi=${psi#avg10=}
+            fi
+            echo "[sample] t=${ts} memavail_kb=${memav} swapfree_kb=${swapfree} load1=${load1} procs=${procs} dartprocs=${dartn} dartrss_kb=${dartrss} mempsi10=${psi}"
+            sleep 3
+          done
+          SAMPLER
+          chmod +x /tmp/ci-sampler.sh
+          : > /tmp/ci-resource-samples.log
+          env -u _PROCESS_TRACKING_ID -u VSTS_PROCESS_LOOKUP_ID \
+            setsid -f bash /tmp/ci-sampler.sh >> /tmp/ci-resource-samples.log 2>&1 || true
+          sleep 1
+          echo "sampler pid: $(cat /tmp/ci-sampler.pid 2>/dev/null || echo '<not recorded — the sampler did not start>')"
+          echo "first samples:"
+          head -n 3 /tmp/ci-resource-samples.log || true
+
       - name: Prove the mutation tool can still tell its three verdicts apart
         # THE CONTROL, AND WHY IT COMES FIRST.
         # A mutation harness whose edits never reach the disk reports a perfect
@@ -369,7 +540,19 @@ jobs:
         # there would turn the POSITIVE control into a timeout-kill and fail the
         # self-test for a reason that has nothing to do with the code. Raising
         # the ceiling makes each verdict rest on a real test result.
-        run: dart run tool/mutate.dart --selftest --timeout=180
+        #
+        # WHY `--heartbeat=15` IS SPELLED OUT WHEN 15 IS ALREADY THE DEFAULT.
+        # The tool prints a `[hb]` line every fifteen seconds giving elapsed
+        # time, mutants done, its own resident memory, its process count and
+        # what is currently in flight. That is the inside view of the same
+        # silences the sampler is watching from outside, and having both means a
+        # gap in the log can be attributed: if the heartbeat keeps ticking
+        # through a quiet stretch the tool was alive and waiting on something,
+        # and if the heartbeat stops too the whole process was stalled or gone.
+        # Written out here rather than left to the default so that the person
+        # reading this file can see that heartbeats are on without going to read
+        # the tool to find out what the default is.
+        run: dart run tool/mutate.dart --selftest --timeout=180 --heartbeat=15
 
       - name: Prove the suite still notices deliberate breakage
         # The stratified subset: a fixed budget of 52 mutants, apportioned
@@ -423,4 +606,150 @@ jobs:
         # other 44 mutants take. It fits inside 45 minutes with room to spare,
         # but the margin is the reason the budget is 52 and not 154: at the old
         # size this arithmetic did not fit at all.
-        run: dart run tool/mutate.dart --quick --jobs=2 --timeout=180
+        #
+        # -------------------------------------------------------------------
+        # WHY NEITHER `--jobs` NOR `--timeout` WAS TOUCHED WHEN THIS STEP
+        # STARTED DYING WITH EXIT 143
+        # -------------------------------------------------------------------
+        #
+        # This is a deliberate ruling and not an oversight, so here is the
+        # argument in full.
+        #
+        # Lowering `--jobs` to 1 is the obvious first move and it is the wrong
+        # one. Start with what it would actually fix. The leading code-level
+        # explanation for the two unexplained silences in the failing log is
+        # that something inside the tool waited with no ceiling on it. A wait
+        # with no ceiling does not care how many workers there are — one worker
+        # can hang exactly as thoroughly as two, it just takes twice as long to
+        # get to the hang. So the change most likely to be proposed is also the
+        # change least likely to address the thing that is suspected.
+        #
+        # Now the part that makes it tempting anyway: lowering it would cost
+        # nothing in detection power. `--jobs` changes wall-clock time and
+        # nothing else. It does not change which mutants are selected — the
+        # `--quick` subset is fixed integer arithmetic over a budget of 52, with
+        # no randomness and no clock in it, so the same commit yields the same
+        # 52 mutants at any job count — and it does not change a single verdict,
+        # because each worker judges its own mutant in its own sandbox copy of
+        # the package. A cheap change that costs no coverage is exactly the kind
+        # of change that gets made without thinking about it.
+        #
+        # And that is the actual reason not to make it now. The diagnostics
+        # added above are landing in this same commit. If `--jobs` moved at the
+        # same time and the next run went green, there would be no way to say
+        # whether the job count fixed it, whether the diagnostics perturbed the
+        # timing, or whether the runner was simply having a better day. One
+        # variable at a time, or the green run teaches nothing.
+        #
+        # WHEN IT SHOULD BE LOWERED, stated in advance so the decision is not
+        # re-argued from scratch: if the sampler's `memavail_kb` is seen falling
+        # toward a low-hundreds-of-megabytes figure as the step proceeds, or if
+        # the post-mortem `ps` shows `dartprocs` accumulating across mutants
+        # rather than returning to its floor between them, then `--jobs=1` is
+        # the right move and the only thing it costs is wall clock. Until one of
+        # those two things is actually observed, it stays at 2 — and for the
+        # same one-variable-at-a-time reason it does not go UP to 4 either,
+        # notwithstanding the note above about public runners having 4 cores.
+        #
+        # `--timeout` is not the thing to change either, and the arithmetic is
+        # worth writing down because it is not obvious. 180 seconds is the
+        # ceiling on ONE `flutter test` invocation, not on a mutant and not on
+        # the step. `_judge` in the tool runs tier 1 first, and escalates every
+        # tier-1 survivor to a re-run against the whole suite before it will
+        # call it a survivor — two invocations, so one mutant can legitimately
+        # occupy a worker for up to 360 seconds without anything being wrong.
+        # Even at that worst case, 52 mutants across two workers sits well
+        # inside the job's 45-minute ceiling, and the step died at 2m02s, which
+        # is nowhere near any timeout in this file. Lowering it would only start
+        # converting slow-but-honest runs into timeout-kills, and a timeout-kill
+        # is the weakest verdict the tool produces.
+        #
+        # Nothing here shrinks the mutant budget either. The step is failing for
+        # a reason nobody understands yet; weakening the gate until it stops
+        # complaining would remove the evidence rather than the fault.
+        run: dart run tool/mutate.dart --quick --jobs=2 --timeout=180 --heartbeat=15
+
+      - name: Post-mortem - what the machine looked like when the step ended
+        # THE STEP THAT MAKES ALL THE OTHERS WORTH HAVING.
+        # `if: always()` is the entire point: without it this step is skipped on
+        # exactly the runs it was written for, because a job stops at its first
+        # failed step and the failure IS the event under investigation. With it,
+        # this runs after the `--quick` step whether that step passed, failed or
+        # was killed outright.
+        #
+        # `continue-on-error: true` is here for the same reason it is on the two
+        # steps above — these are observations, and an observation that can fail
+        # a build is a liability. It does not and cannot rescue a failed
+        # `--quick` step: that step has no `continue-on-error` of its own, so
+        # its failure still fails the job.
+        if: always()
+        continue-on-error: true
+        run: |
+          # Stop the sampler first, so the tail below is not moving while it is
+          # being read. Both forms are tried because the pid file is written by
+          # the sampler itself and may not exist if it never started.
+          kill "$(cat /tmp/ci-sampler.pid 2>/dev/null)" 2>/dev/null || true
+          pkill -f ci-sampler.sh || true
+
+          echo "===== BEGIN resource samples ====="
+          # HOW TO READ THIS. One line every three seconds, so 200 lines is
+          # about the last ten minutes — comfortably more than the two minutes
+          # the failing step survived. Read the last few lines first and ask
+          # three questions in this order. Was `memavail_kb` collapsing, and was
+          # `swapfree_kb` going with it? That is memory exhaustion. Was
+          # `mempsi10` climbing off zero? That is the kernel saying it was
+          # stalling on memory even if it never had to kill anything. Was
+          # `dartprocs` growing steadily instead of oscillating around a small
+          # number? That is a process leak, and `dartrss_kb` says what it cost.
+          # If all three are flat and boring right up to the last sample, then
+          # the machine was healthy when the step died and the cause is
+          # external — which is a real answer and a very different one.
+          echo "sample count:"
+          wc -l /tmp/ci-resource-samples.log || true
+          echo "first sample (so the covered window is known):"
+          head -n 1 /tmp/ci-resource-samples.log || true
+          echo "-----"
+          tail -n 200 /tmp/ci-resource-samples.log || true
+          echo "===== END resource samples ====="
+
+          echo "===== BEGIN process table, biggest first ====="
+          # THE SINGLE MOST VALUABLE LINE IN THIS WHOLE STEP. It names every
+          # surviving process with its resident memory AND its age. The failing
+          # run's own log ended with the runner reporting
+          # `Terminate orphan process: pid (3804) (dart:flutter_to)`, which says
+          # something was still alive after the step was gone but not what it
+          # was or how long it had been there. `etime` answers that: an orphan
+          # whose elapsed time is longer than the mutant that spawned it is a
+          # leaked worker, and that is direct evidence for the process-leak
+          # hypothesis rather than an inference from a silence.
+          ps -eo pid,ppid,rss,etime,stat,comm,args --sort=-rss | head -30 || true
+          echo "===== END process table ====="
+
+          echo "===== BEGIN memory and disk after the fact ====="
+          free -m || true
+          df -h || true
+          echo "===== END memory and disk after the fact ====="
+
+          echo "===== BEGIN kernel kill search ====="
+          # WHAT AN EMPTY RESULT HERE MEANS — read this before concluding
+          # anything, because a grep that prints nothing must not be mistaken
+          # for a check that was not run.
+          #
+          # Both of the kernel-side memory killers, the in-kernel OOM killer and
+          # systemd-oomd, kill with SIGKILL. A process killed by SIGKILL exits
+          # 137 (128 + 9). The code actually observed was 143 (128 + 15), which
+          # is SIGTERM — something asked the process to stop rather than shot
+          # it. So this search is the test that separates the two memory
+          # stories from everything else: if it finds an OOM line, the machine
+          # ran out of memory and the exit code needs re-explaining; if it finds
+          # nothing, that is evidence AGAINST a simple out-of-memory kill and
+          # points instead at a platform- or agent-issued terminate — the runner
+          # itself, an eviction, or something in the tool asking a child to
+          # stop. The explicit "no OOM lines" message below exists so that the
+          # difference between "checked and found nothing" and "never checked"
+          # is visible in the web log.
+          sudo dmesg -T 2>/dev/null | tail -n 100 | grep -iE 'oom|killed process|out of memory' \
+            || echo "dmesg: checked the last 100 kernel messages, no OOM lines"
+          sudo journalctl -k --since "-10 min" --no-pager 2>/dev/null | grep -iE 'oom|killed process|out of memory' \
+            || echo "journalctl -k: checked the last 10 minutes, no OOM lines"
+          echo "===== END kernel kill search ====="
