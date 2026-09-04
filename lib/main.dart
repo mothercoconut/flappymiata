@@ -32,6 +32,8 @@ import 'package:flappymiata/game/run_code.dart';
 import 'package:flappymiata/ui/assist.dart';
 import 'package:flappymiata/ui/game_screens.dart';
 import 'package:flappymiata/ui/high_score_store.dart';
+import 'package:flappymiata/ui/motion.dart';
+import 'package:flappymiata/ui/palette.dart' as palette;
 
 // -----------------------------------------------------------------------------
 // DRAW ORDER.
@@ -145,17 +147,35 @@ void main() {
 /// start the app, hand Flutter a game. Input and drawing live on the game
 /// below; gameplay lives in `lib/game/`; screens and menus belong in `lib/ui/`,
 /// where one person can own a file outright.
-class FlappyMiataApp extends StatelessWidget {
+///
+/// WHY IT IS A `StatefulWidget` AND NO LONGER A `GameWidget.controlled`:
+/// `.controlled` builds the game from a factory and never hands the instance
+/// back, and the accessibility bridge below needs the instance — it reads the
+/// platform's "reduce motion" switch out of the `MediaQuery` and pushes it into
+/// the game. Creating the game once in a field initialiser gives exactly the
+/// guarantee `.controlled` was here for: a `State` outlives a rebuild, so a
+/// rebuild cannot construct a second game and throw away the run in progress.
+class FlappyMiataApp extends StatefulWidget {
   const FlappyMiataApp({super.key});
 
   @override
+  State<FlappyMiataApp> createState() => _FlappyMiataAppState();
+}
+
+class _FlappyMiataAppState extends State<FlappyMiataApp> {
+  /// `late final` on a field, so the game is built on the first build and never
+  /// again.
+  late final FlappyMiataGame _game = FlappyMiataGame();
+
+  @override
   Widget build(BuildContext context) {
-    // `.controlled` lets the widget's own State create and keep the game
-    // instance. Building `GameWidget(game: FlappyMiataGame())` directly would
-    // construct a fresh game on every rebuild and throw away the run in
-    // progress.
-    return const GameWidget<FlappyMiataGame>.controlled(
-      gameFactory: FlappyMiataGame.new,
+    // The bridge is the ONLY place the operating system's accessibility
+    // settings enter this app. See `lib/ui/motion.dart` for why it has to be a
+    // widget: `MediaQuery` needs a `BuildContext`, a `FlameGame` has none, and
+    // the setting can change while the app is open.
+    return SystemMotionBridge(
+      host: _game,
+      child: GameWidget<FlappyMiataGame>(game: _game),
     );
   }
 }
@@ -174,7 +194,7 @@ class FlappyMiataApp extends StatelessWidget {
 /// surface becomes the tap target with no invisible button to size or place.
 class FlappyMiataGame extends FlameGame
     with TapCallbacks
-    implements GameScreenHost {
+    implements GameScreenHost, MotionHost {
   /// Which course this session plays. Fixed for the life of the game object, so
   /// a restart puts the player on the same obstacles — otherwise "beat your
   /// ghost" would be a different question every attempt.
@@ -275,6 +295,24 @@ class FlappyMiataGame extends FlameGame
   /// world is a rendering decision, and this is the renderer.
   bool _paused = false;
 
+  /// What the player has asked for about decorative motion. Follows the
+  /// platform by default. See `lib/ui/motion.dart`.
+  MotionSetting _motionSetting = MotionSetting.system;
+
+  /// What the platform's own accessibility switch says, as last reported by
+  /// [SystemMotionBridge]. False until the bridge has been built, which is the
+  /// right default: a game with no widget tree over it — a headless test — has
+  /// no platform to ask.
+  bool _systemDisablesAnimations = false;
+
+  /// The decorative clock the backdrop's parallax is drawn from.
+  ///
+  /// SEPARATE FROM THE RUN'S CLOCK, and that separation is the feature. It
+  /// takes raw wall-clock seconds, it is read by nothing but [_BackdropLayer],
+  /// and there is no path from it into `_run` — which is what makes "reduced
+  /// motion changes no run" true by construction rather than by care.
+  final DecorClock _decor = DecorClock();
+
   /// The assist solver, or null when assist mode is off — which is the default,
   /// and is also what "off" MEANS here. See [toggleAssist].
   AssistSolver? _assist;
@@ -311,6 +349,16 @@ class FlappyMiataGame extends FlameGame
   /// This frame's flap-window advice, or null when assist mode is off or has
   /// nothing to say. Read-only, for the layer that draws it.
   AssistAdvice? get advice => _advice;
+
+  /// Seconds of decoration elapsed, for the backdrop to draw its parallax from.
+  /// Frozen while motion is reduced.
+  double get decorPhase => _decor.phase;
+
+  /// Whether decorative motion is currently stopped.
+  bool get reduceMotion => shouldReduceMotion(
+        setting: _motionSetting,
+        systemDisablesAnimations: _systemDisablesAnimations,
+      );
 
   // ---------------------------------------------------------------------------
   // GameScreenHost — everything the screens in `lib/ui/` are allowed to see.
@@ -350,6 +398,33 @@ class FlappyMiataGame extends FlameGame
 
   @override
   bool get assistEnabled => _assist != null;
+
+  @override
+  MotionSetting get motionSetting => _motionSetting;
+
+  @override
+  bool get systemDisablesAnimations => _systemDisablesAnimations;
+
+  /// Told by [SystemMotionBridge] whenever the platform's switch changes.
+  ///
+  /// Guarded on a real change, because `didChangeDependencies` fires for any
+  /// inherited widget the bridge depends on — a rotation moves the
+  /// `MediaQuery` — and bumping [revision] on every one of those would rebuild
+  /// the screens for nothing.
+  @override
+  set systemDisablesAnimations(bool value) {
+    if (_systemDisablesAnimations == value) return;
+    _systemDisablesAnimations = value;
+    _revision.value++;
+  }
+
+  /// Steps the motion setting on. Touches no rule and no run — see
+  /// [GameScreenHost.cycleMotion].
+  @override
+  void cycleMotion() {
+    _motionSetting = nextMotionSetting(_motionSetting);
+    _revision.value++;
+  }
 
   /// Turns the flap-window highlight on and off.
   ///
@@ -439,7 +514,7 @@ class FlappyMiataGame extends FlameGame
   late final _ScorePanel _panel;
 
   @override
-  Color backgroundColor() => const Color(0xFF10233F);
+  Color backgroundColor() => const Color(palette.gameBackground);
 
   @override
   Future<void> onLoad() async {
@@ -693,6 +768,13 @@ class FlappyMiataGame extends FlameGame
 
       _captureFinishedRun();
       _updateAssist();
+
+      // The decoration's own clock. Inside the `!_paused` branch with
+      // everything else, because a stopped world whose hills kept sliding would
+      // be a paused game that still looked like it was moving. `reduceMotion`
+      // is asked here, once per frame, rather than cached: the platform switch
+      // can change under a running game.
+      _decor.advance(dt, reduced: reduceMotion);
     }
 
     _panel.text = _hudText;
@@ -792,14 +874,31 @@ class FlappyMiataGame extends FlameGame
   }
 }
 
-/// Everything that scrolls: both pipes of every obstacle, and the car. Sits at
-/// [_worldPriority], i.e. underneath the score.
+/// The sky, the hills, the clouds and the ground: everything behind the game.
 ///
-/// ONE component for the whole world rather than one component per obstacle,
-/// because `tick` rebuilds the obstacle list from scratch every frame. The
-/// model already owns those objects; mirroring them into a component tree would
-/// mean adding and removing components sixty times a second in order to display
-/// data that is already sitting in a field.
+/// ============================================================================
+/// THE ONLY THING IN THIS GAME THAT MOVES FOR DECORATION
+/// ============================================================================
+///
+/// The hills slide and the clouds drift, both far slower than the pipes.
+/// Parallax is depth stated as a speed ratio and nothing else, which is why
+/// `lib/ui/motion.dart` expresses it as two numbers rather than as two layers
+/// of art.
+///
+/// It is also the whole of what reduced motion switches off. That is a
+/// deliberately small claim and it is worth being precise about, because the
+/// mistake it is guarding against is a big one: everything ELSE that moves here
+/// is information. The pipes are the course. The car is the player. The ghost
+/// is the record being raced. The assist path is where the car is going.
+/// Stopping any of those would not be reducing motion, it would be taking the
+/// game away from the player who asked for less motion — which is exactly the
+/// "accessible mode is an easy mode" failure, and the reason
+/// `test/reduced_motion_test.dart` replays a whole run both ways and demands
+/// the two be identical frame for frame.
+///
+/// The parallax reads [FlappyMiataGame.decorPhase], which stops advancing when
+/// motion is reduced. There is no second switch and no per-layer flag: one
+/// clock, and everything decorative is drawn from it.
 class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
   _BackdropLayer() : super(priority: -100);
 
@@ -807,17 +906,62 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
     ..shader = ui.Gradient.linear(
       const Offset(0, 0),
       const Offset(0, 900),
-      const <Color>[Color(0xFF173B62), Color(0xFF4C7E92)],
+      const <Color>[Color(palette.skyTop), Color(palette.skyBottom)],
     );
-  static final Paint _horizon = Paint()..color = const Color(0xFF78A88D);
-  static final Paint _hill = Paint()..color = const Color(0xFF5F9B8A);
-  static final Paint _cloud = Paint()..color = const Color(0xB8F4FBF4);
-  static final Paint _ground = Paint()..color = const Color(0xFF264B3D);
+  static final Paint _horizon =
+      Paint()..color = const Color(palette.horizonBand);
+  static final Paint _hill = Paint()..color = const Color(palette.hill);
+  static final Paint _cloud = Paint()..color = const Color(palette.cloud);
+  static final Paint _ground = Paint()..color = const Color(palette.ground);
 
   @override
   void render(Canvas canvas) {
     final Size size = game.size.toSize();
     canvas.drawRect(Offset.zero & size, _sky);
+
+    // How far each layer has slid, as a fraction of one screen width in [0, 1).
+    // Frozen at whatever it was when motion was last reduced.
+    final double phase = game.decorPhase;
+    final double hillShift =
+        parallaxOffset(phase, hillDriftPerSecond) * size.width;
+    final double cloudShift =
+        parallaxOffset(phase, cloudDriftPerSecond) * size.width;
+
+    // EACH LAYER IS DRAWN TWICE, ONE WIDTH APART, and the pair is slid left by
+    // strictly less than a width. So the seam between the two copies is always
+    // off the right-hand edge, and the layer repeats forever without any
+    // wrapping arithmetic per shape. The hill path's first and last points are
+    // both at the horizon, so where one copy ends the next begins at the same
+    // height and the join is invisible.
+    _tile(canvas, size, hillShift, _drawHills);
+    _tile(canvas, size, cloudShift, _drawClouds);
+
+    canvas.drawRect(
+      Rect.fromLTWH(0, size.height * 0.70, size.width, size.height * 0.06),
+      _horizon,
+    );
+    canvas.drawRect(
+      Rect.fromLTWH(0, size.height * 0.76, size.width, size.height * 0.24),
+      _ground,
+    );
+  }
+
+  /// Draws [paint] twice, a screen width apart, shifted left by [shift].
+  void _tile(
+    Canvas canvas,
+    Size size,
+    double shift,
+    void Function(Canvas, Size) paint,
+  ) {
+    canvas.save();
+    canvas.translate(-shift, 0);
+    paint(canvas, size);
+    canvas.translate(size.width, 0);
+    paint(canvas, size);
+    canvas.restore();
+  }
+
+  void _drawHills(Canvas canvas, Size size) {
     final Path hills = Path()
       ..moveTo(0, size.height * 0.70)
       ..lineTo(size.width * 0.16, size.height * 0.57)
@@ -828,16 +972,11 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
       ..lineTo(size.width, size.height * 0.70)
       ..close();
     canvas.drawPath(hills, _hill);
+  }
+
+  void _drawClouds(Canvas canvas, Size size) {
     _drawCloud(canvas, Offset(size.width * 0.20, size.height * 0.18), 0.9);
     _drawCloud(canvas, Offset(size.width * 0.76, size.height * 0.29), 0.65);
-    canvas.drawRect(
-      Rect.fromLTWH(0, size.height * 0.70, size.width, size.height * 0.06),
-      _horizon,
-    );
-    canvas.drawRect(
-      Rect.fromLTWH(0, size.height * 0.76, size.width, size.height * 0.24),
-      _ground,
-    );
   }
 
   void _drawCloud(Canvas canvas, Offset center, double scale) {
@@ -861,15 +1000,31 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
   }
 }
 
+/// Everything that scrolls: both pipes of every obstacle. Sits at
+/// [_worldPriority], i.e. underneath the score.
+///
+/// ONE component for the whole world rather than one component per obstacle,
+/// because `tick` rebuilds the obstacle list from scratch every frame. The
+/// model already owns those objects; mirroring them into a component tree would
+/// mean adding and removing components sixty times a second in order to display
+/// data that is already sitting in a field.
+///
+/// THE PIPES KEPT THEIR GREEN when the scenery behind them did not. They are
+/// the thing the player must not hit, so where a green and a green had to be
+/// pulled apart for a deuteranope, the obstacle stayed put and the background
+/// moved. See `lib/ui/palette.dart`.
 class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
   _WorldLayer() : super(priority: _worldPriority);
 
   static const double _pipeCapHeight = 44.0;
 
-  static final Paint _pipeOutline = Paint()..color = const Color(0xFF153D2B);
-  static final Paint _pipeBody = Paint()..color = const Color(0xFF2D7A4A);
-  static final Paint _pipeHighlight = Paint()..color = const Color(0xFF65B96C);
-  static final Paint _pipeShadow = Paint()..color = const Color(0xFF205A3A);
+  static final Paint _pipeOutline =
+      Paint()..color = const Color(palette.pipeOutline);
+  static final Paint _pipeBody = Paint()..color = const Color(palette.pipeBody);
+  static final Paint _pipeHighlight =
+      Paint()..color = const Color(palette.pipeHighlight);
+  static final Paint _pipeShadow =
+      Paint()..color = const Color(palette.pipeShadow);
 
   @override
   void render(Canvas canvas) {
@@ -1029,7 +1184,7 @@ class _GhostLayer extends Component with HasGameReference<FlappyMiataGame> {
   /// file's palette, and readable against both the sky and the pipes.
   static final Paint _ghostPaint = Paint()
     ..colorFilter =
-        const ColorFilter.mode(Color(0x8C8BD3C7), BlendMode.srcIn)
+        const ColorFilter.mode(Color(palette.ghostSilhouette), BlendMode.srcIn)
     ..filterQuality = FilterQuality.medium
     ..isAntiAlias = true;
 
@@ -1067,20 +1222,33 @@ class _AssistLayer extends Component with HasGameReference<FlappyMiataGame> {
   _AssistLayer() : super(priority: _assistPriority);
 
   /// The coasting part of the path: where the car goes if nothing is tapped.
+  ///
+  /// AMBER, AND IT USED TO BE WHITE. Three signals are drawn on top of each
+  /// other here — this path, the offered window, the deadline — and the two
+  /// dichromacies this app is checked against both lose the red-green axis. So
+  /// the three are spread along the axis that survives, blue to yellow, with
+  /// teal at one end and amber at the other. White at 60% scored 2.14 ΔE₀₀
+  /// against the window for a protanope, which is to say the two lines were the
+  /// same line. See `lib/ui/palette.dart`.
   static final Paint _coast = Paint()
-    ..color = const Color(0x99FFFFFF)
+    ..color = const Color(palette.assistCoast)
     ..style = PaintingStyle.stroke
     ..strokeWidth = 2;
 
   /// The offered window. Teal, like every other affordance in this game.
   static final Paint _window = Paint()
-    ..color = const Color(0xE68BD3C7)
+    ..color = const Color(palette.assistWindow)
     ..style = PaintingStyle.stroke
     ..strokeWidth = 6;
 
   /// The last frame on which doing nothing is still survivable.
+  ///
+  /// The stroke widths above and below are not decoration either: colour is
+  /// never the only thing separating these three, because a channel that some
+  /// readers do not have cannot be the only channel. 2px, 6px and a
+  /// cross-stroke say the same thing the hues do.
   static final Paint _deadline = Paint()
-    ..color = const Color(0xE6FF2D78)
+    ..color = const Color(palette.assistDeadline)
     ..style = PaintingStyle.stroke
     ..strokeWidth = 3;
 
@@ -1173,17 +1341,17 @@ class _DebugOverlay extends Component with HasGameReference<FlappyMiataGame> {
   /// can be read without a legend: pink is the car, amber is a pipe, cyan is
   /// the middle of the gap.
   static final Paint _carOutline = Paint()
-    ..color = const Color(0xFFFF2D78)
+    ..color = const Color(palette.debugCarBox)
     ..style = PaintingStyle.stroke
     ..strokeWidth = 2;
 
   static final Paint _obstacleOutline = Paint()
-    ..color = const Color(0xFFFFC13B)
+    ..color = const Color(palette.debugObstacleBox)
     ..style = PaintingStyle.stroke
     ..strokeWidth = 2;
 
   static final Paint _gapCentreLine = Paint()
-    ..color = const Color(0xFF3BE0FF)
+    ..color = const Color(palette.debugGapCentre)
     ..style = PaintingStyle.stroke
     ..strokeWidth = 2;
 
@@ -1253,9 +1421,18 @@ class _ScorePanel extends PositionComponent
   /// rectangle is that pipe colour cannot show through it. Anything below full
   /// alpha quietly reintroduces the unreadable-score problem, and it would only
   /// show up in the handful of frames a pipe spends behind the text.
-  static final Paint _backing = Paint()..color = const Color(0xE812263D);
+  ///
+  /// IT WAS NOT `FF`. This comment said one thing and the constant beside it
+  /// said `0xE8` — 91% — so 9% of whatever passed underneath was mixing into
+  /// the colour the score was being read against, and the contrast of that pair
+  /// was a property of the frame rather than of the palette. The car passes
+  /// behind this panel too, not only the pipes: the car sits at x = 0.30 and is
+  /// 0.16 wide, and the panel starts 16 logical pixels from the left edge.
+  /// `test/palette_contrast_test.dart` now asserts the alpha rather than
+  /// trusting the paragraph above it.
+  static final Paint _backing = Paint()..color = const Color(palette.hudSurface);
   static final Paint _cardBorder = Paint()
-    ..color = const Color(0xFF8BD3C7)
+    ..color = const Color(palette.panelBorder)
     ..style = PaintingStyle.stroke
     ..strokeWidth = 3;
 
@@ -1267,7 +1444,7 @@ class _ScorePanel extends PositionComponent
     position: Vector2(_padding, _padding),
     textRenderer: TextPaint(
       style: const TextStyle(
-        color: Color(0xFFFFFFFF),
+        color: Color(palette.ink),
         fontSize: 20.0,
         height: 1.4,
       ),

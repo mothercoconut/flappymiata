@@ -253,8 +253,14 @@ of those are required for this project.
 Start of an open-ended quality pass. Project 2 is already submitted; none of
 this is on a deadline.
 
-**Merged.** `sprite-ui` (@Sdav239) into trunk: pixel Miata sprite, parallax
+**Merged.** `sprite-ui` (@Sdav239) into trunk: pixel Miata sprite, layered
 background, capped pipes, styled score panel.
+
+CORRECTION, 2026-09-04: this said "parallax background". It was not parallax —
+the backdrop was static. Nothing moved until the reduced-motion work added
+real parallax so that the toggle had something to switch off. I wrote the
+original line from the branch's own commit message without checking what it
+drew.
 
 **The bug.** The car drew about three times wider than the box that kills you.
 Measured on a 1080x2400 screen:
@@ -989,3 +995,79 @@ underneath it.
 
 **Unverified on hardware.** Assist mode's appearance — legibility over the pipes,
 whether the window is noticed in time, whether it helps or distracts.
+
+## 2026-09-04 — Phase 6a: accessibility, computed rather than eyeballed
+
+**Bar 6 closed.** New `lib/ui/palette.dart`, `colour_math.dart`, `motion.dart`,
+`tool/palette_report.dart`, six test files. Tests 282 -> 367. No dependency added.
+
+**The calculator was pinned before anything was judged by it.** WCAG relative
+luminance and contrast, verified against published reference pairs — black on
+white 21.0000 exactly, `#767676` on white 4.5422 against a published 4.54, pure
+red on white 3.9985. Alpha compositing pinned against Flutter's own
+`Color.alphaBlend` over 40 combinations, because it has to agree with the
+renderer rather than with physics. CIEDE2000 pinned against all 31 rows of the
+Sharma/Melkote/Trussell table to 1e-4. That found a real bug: greys came out
+with non-zero a*/b* because the D65 white point was the rounded tabulated value
+rather than the column sums of the sRGB matrix.
+
+**No text pair ever failed 4.5:1.** I am not going to claim a rescue that did
+not happen. What was actually wrong is subtler: two text-bearing surfaces were
+translucent — `hudSurface` at `0xE8`, `cardSurface` at `0xF2` — so their contrast
+was partly a property of whichever pipe was scrolling behind. The comment beside
+`hudSurface` insisted the alpha "is FF and has to stay FF" while the code said
+otherwise; the code was wrong. Both are opaque now and a test asserts it, because
+a paragraph cannot fail and an assertion can.
+
+**Colours changed for colourblind distinguishability**, with before/after
+CIEDE2000 against the pair each one was failing:
+
+```
+ground        0xFF264B3D -> 0xFF3A3F52   5.09/5.25/5.16  ->  24.16/18.06/21.24
+horizonBand   0xFF78A88D -> 0xFF8C9BA8  12.09/12.37/12.55 -> 30.79/29.73/31.45
+assistCoast   0x99FFFFFF -> 0xE6FFD24A   8.61/3.65/2.14  ->  32.18/28.51/23.14
+hill          0xFF5F9B8A -> 0xFF5A7C9B   did not fail; changed for scene coherence
+```
+
+Where a green and a green had to be pulled apart, the obstacle kept its colour
+and the scenery moved. `assistCoast` went amber so the three assist signals sit
+along the blue-yellow axis, which both simulated deficiencies preserve.
+
+**Metric and its limits.** CIEDE2000 over Viénot/Brettel/Mollon dichromat
+simulation, applied in linear light. Threshold 15 ΔE00 — **a judgement, not a
+standard**, unlike 4.5:1. ΔE00 = 1 is the lab JND for adjacent uniform patches
+under controlled light; these are small shapes moving half a screen width per
+second on an uncalibrated phone, so 15 is a chosen multiplier and says so.
+
+The simulator has no published reference table, so it is pinned structurally —
+idempotent, greys unchanged, alpha preserved — **plus a positive control** that
+requires it to collapse red against green, or an identity function would pass
+everything else.
+
+**Stated limits, not buried.** This models dichromacy, a missing cone. The far
+commoner protanomaly and deuteranomaly are a *shifted* cone and are not modelled
+at all. Tritanopia is not covered — and the colours chosen to survive red-green
+loss lean on exactly the axis a tritanope loses. No colourblind player has seen
+this game.
+
+**The sprite was handled, not excluded.** A PNG cannot be a palette entry, so the
+test decodes it: 19,414 opaque pixels, darkest `#FF060B0C`, brightest
+`#FFFEFEFE`. Two findings — the file's alpha tops out at **254**, so a strict
+`== 255` test found nothing, and `rawRgba` is premultiplied and had to be divided
+back out. The sprite's extreme pixels are pushed through both text surfaces to
+show compositing cannot reach the glyphs, with the old `0xE8` asserted to fail
+that same statement so the check is not vacuous.
+
+**Reduced motion.** Defaults to `MediaQuery.disableAnimations`, re-read on
+`didChangeDependencies`, with an in-app override cycling system → reduced → full.
+The label names the *resolved* state, because "AUTO" alone answers the wrong
+question. It stops the backdrop parallax and nothing else: pipes are the course,
+the car is the player, the ghost is the record, the assist path is the future.
+Three tests hold the model identical with motion on and off.
+
+**The demonstration I did not ask for, and the best one.** Replacing the decor
+phase with a constant in the render path left every clock and offset test green.
+Only a pixel-level test caught it — so one was written: render the tree to real
+RGBA at two decor phases while the run is `ready`, and require the bytes to
+differ with motion full and be identical with it reduced. Without it, reduced
+motion would have had thorough tests of a clock that nothing drew.
