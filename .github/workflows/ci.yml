@@ -1,0 +1,386 @@
+# =============================================================================
+# flappymiata — continuous integration
+# =============================================================================
+#
+# WHAT THIS FILE IS FOR
+#
+# Six things have to be true before a change is allowed onto `main`. This file
+# is the machine that checks all six on every push and every pull request, so
+# that "it worked on my laptop" stops being the standard of evidence.
+#
+#   1. the code still analyses clean          (`flutter analyze`)
+#   2. the whole test suite still passes      (`flutter test`)
+#   3. the Android app still builds           (`flutter build apk --debug`)
+#   4. the shipped course is still winnable   (`tool/prove_fairness.dart`)
+#   5. the mutation tool can still tell its three verdicts apart
+#                                             (`tool/mutate.dart --selftest`)
+#   6. the test suite still kills mutants     (`tool/mutate.dart --quick`)
+#
+# EVERY ONE OF THESE HAS BEEN OBSERVED FAILING. That matters more than it
+# sounds. A CI job whose steps cannot fail is worse than no CI at all, because
+# it produces a green tick that nobody has any reason to trust. Before this file
+# was committed, each of the six commands below was run locally against a
+# deliberately broken tree, and each was confirmed to exit non-zero and to name
+# the real cause; each broken file was then restored and checked byte-for-byte
+# by SHA-256, and the command re-run to confirm it went green again.
+#
+# HOW GITHUB DECIDES A STEP FAILED
+#
+# It reads the process exit code. Nothing else. Not the words "FAILED" in the
+# output, not a red line, not a summary count — the exit code, and only that.
+# This is not a theoretical concern for this repo: a Dart `Future<int> main()`
+# has its return value *discarded* by the VM (only a synchronous `int main()`
+# sets the exit code), so a tool that ended with `return 1` would exit 0 and
+# every one of its findings would sail past the gate. `tool/mutate.dart` carries
+# a comment about exactly that bug and sets `exitCode` explicitly instead.
+#
+# WHY FIVE JOBS AND NOT ONE
+#
+# Steps inside a job run one after another and stop at the first failure. Jobs
+# run in parallel on separate machines and each gets its own tick in the pull
+# request. Splitting the work means:
+#   * one red tick names the gate that broke, without having to read a log;
+#   * a slow gate (the Android build, the fairness proof) does not delay a fast
+#     one, so `flutter analyze` reports in about two minutes instead of ten;
+#   * a failing analyze does not hide the test results, and vice versa.
+# The two mutation gates are deliberately NOT split, because the second one is
+# only meaningful if the first one passed: `--selftest` proves the tool can say
+# KILLED, SURVIVED and INVALID on demand, and without that proof a clean
+# `--quick` report is just a tool that says nice things.
+
+name: CI
+
+# WHEN THIS RUNS.
+# `push` to main catches anything that lands on trunk, including a direct commit
+# or a merge. `pull_request` catches it one step earlier, on the branch, which is
+# the point of the exercise: the gate should go red before the bad code is on
+# main, not after.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets a human re-run the whole thing from the Actions tab without pushing an
+  # empty commit — useful when a run failed for an infrastructure reason.
+  workflow_dispatch:
+
+# LEAST PRIVILEGE.
+# The default token can write to the repository. Nothing here needs to write
+# anything, so it is dropped to read-only. If this workflow is ever compromised
+# — say by a dependency that runs code during `pub get` — it cannot push.
+permissions:
+  contents: read
+
+# DO NOT PAY TWICE FOR THE SAME BRANCH.
+# Pushing three times in a minute would otherwise start three full runs and the
+# first two would be answering a question nobody is asking any more. This
+# cancels the superseded ones. `github.ref` is the branch, so runs on different
+# branches never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # WHY THE VERSION IS PINNED AND NOT `latest`.
+  # This is the single most important line in the file. With `latest`, the SDK
+  # under CI changes the day Flutter ships a release — and it changes without
+  # anybody on this project touching anything. That means a build that was green
+  # on Friday can be red on Monday over a change nobody made, and, far worse, a
+  # green run stops being evidence about the code because the toolchain that
+  # produced it is not the toolchain anyone tested against.
+  #
+  # 3.47.2 is what the project is developed against locally:
+  #     Flutter 3.47.2 • channel stable • Dart 3.13.2
+  # Pinning makes a toolchain upgrade a deliberate commit that shows up in the
+  # diff and can be reverted, which is what an upgrade should be.
+  FLUTTER_VERSION: '3.47.2'
+  FLUTTER_CHANNEL: stable
+
+  # The Android build needs a JDK. 21 matches the local
+  # `jdk-21.0.3.9-hotspot`; `android/app/build.gradle.kts` compiles to Java 17
+  # bytecode, so the JDK only has to be 17 or newer to run Gradle and AGP 9.1.
+  JAVA_VERSION: '21'
+
+jobs:
+  # ===========================================================================
+  # GATE 1 — the code analyses clean
+  # ===========================================================================
+  static-analysis:
+    name: Gate 1 - code analyses clean
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # a hung job otherwise burns quota for six hours
+
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          # CACHING, AND WHY IT IS SAFE HERE.
+          # This caches the downloaded Flutter SDK (about a gigabyte) and the
+          # pub package cache. The action's cache key already includes the OS,
+          # the channel, the SDK version and the CPU architecture — and because
+          # the version above is pinned rather than floating, that key is stable
+          # and every run after the first restores instead of downloading.
+          #
+          # A cache is only safe when a stale entry cannot change the answer.
+          # An SDK keyed by its exact version, and packages keyed by the
+          # resolved dependency set, both satisfy that. Note what is NOT cached
+          # anywhere in this file: `build/` and `.dart_tool/`. Those hold
+          # compiled output. Restoring them could let a run pass using an
+          # artefact built from *different* source, which is precisely the
+          # failure a build gate exists to catch.
+          cache: true
+
+      - name: Report the toolchain actually in use
+        # Printed so that a person watching the log can confirm with their own
+        # eyes that the pin above took effect, rather than trusting that it did.
+        run: flutter --version
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Prove the analyzer finds nothing
+        # `flutter analyze` exits 1 on any error, warning or lint under
+        # `analysis_options.yaml` (which pulls in flutter_lints and excludes
+        # only `build/` and `android/`). No `--fatal-infos` is needed: the
+        # default already fails the build on an issue.
+        run: flutter analyze
+
+  # ===========================================================================
+  # GATE 2 — the whole test suite passes
+  # ===========================================================================
+  unit-tests:
+    name: Gate 2 - all 82 tests pass
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Prove every test in the suite still passes
+        # No file arguments: `flutter test` with no paths runs everything under
+        # `test/`, which is what makes this a gate over the whole suite rather
+        # than over whichever files someone remembered to list. It exits 1 if
+        # any test fails and 1 if any test file fails to compile.
+        run: flutter test
+
+  # ===========================================================================
+  # GATE 3 — the Android app still builds
+  # ===========================================================================
+  # Split out on its own because it is the slowest gate by a wide margin and
+  # the only one that needs a JDK, the Android SDK and Gradle. Everything else
+  # would be waiting on it if they shared a job.
+  android-build:
+    name: Gate 3 - Android debug APK builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@v4
+
+      - name: Install JDK ${{ env.JAVA_VERSION }} for Gradle
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          # Sets JAVA_HOME for every later step, which is what the Flutter tool
+          # reads to find a JDK. The Android SDK itself is already installed on
+          # the ubuntu-latest image with ANDROID_HOME set, so it needs no step.
+
+      - name: Cache Gradle's downloads
+        uses: actions/cache@v4
+        with:
+          # Two separate things live here and both are worth keeping: the Gradle
+          # distribution itself (~200 MB — `gradle-wrapper.properties` pins
+          # 9.3.1) and the resolved Maven artefacts for AGP, Kotlin and the
+          # AndroidX libraries.
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # WHY THE KEY IS WHAT IT IS.
+          # The cache must miss whenever the thing it caches could legitimately
+          # change, and hit otherwise. What changes Gradle's downloads is the
+          # build definition: the wrapper's pinned Gradle version, the plugin
+          # and dependency versions in the `.gradle.kts` files, and the flags in
+          # `gradle.properties`. Hashing exactly those files gives a key that
+          # turns over when — and only when — one of them is edited.
+          #
+          # `restore-keys` is the fallback: on a miss, start from the newest
+          # cache that shares the prefix and re-download only the difference.
+          # Without it, one edited dependency line means downloading everything
+          # from scratch.
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Install the pinned Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Make the Gradle wrapper executable if it is checked in
+        # A NOTE FOR WHOEVER READS THIS LOG AND SEES IT DO NOTHING.
+        # `android/.gitignore` excludes `gradlew`, `gradlew.bat` and
+        # `gradle-wrapper.jar`, so on a fresh clone they do not exist and the
+        # Flutter tool injects its own copies (already executable) before it
+        # calls Gradle. This step is therefore a no-op today, and it is here for
+        # the day someone commits the wrapper from Windows: git would store it
+        # without the Unix executable bit and every Linux run would then fail
+        # with "Permission denied" on a file that looks perfectly fine in the
+        # editor. `.gitattributes` already pins `gradlew` to LF endings for the
+        # same class of reason; the mode bit is the half git does not fix.
+        run: test -f android/gradlew && chmod +x android/gradlew || true
+
+      - name: Prove the Android app still compiles and packages
+        # The debug variant, not release: it needs no signing key, so it can run
+        # on a public runner with no secrets, and it exercises everything that
+        # can actually break — the Dart kernel compile, the Kotlin compile,
+        # asset packaging and the manifest merge.
+        #
+        # If this ever dies with an out-of-memory error: `android/gradle.properties`
+        # asks for `-Xmx8G`, which is more than a 2-core runner has. Do not edit
+        # that file — it is shared with the other developer's machine. Write a
+        # smaller value into `~/.gradle/gradle.properties` in a step above
+        # instead; Gradle gives the home file precedence over the project one.
+        run: flutter build apk --debug
+
+      - name: Keep the APK so it can be downloaded and installed
+        # Not a gate — a convenience. `if: success()` is the default, so this
+        # only runs when the build actually produced an APK.
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: error # an empty artifact would be a silent lie
+          retention-days: 14
+
+  # ===========================================================================
+  # GATE 4 — the shipped course is still winnable
+  # ===========================================================================
+  # Split out because it takes roughly two minutes of pure computation and
+  # depends on nothing but the Dart VM: no JDK, no Android SDK, no Gradle.
+  fairness-proof:
+    name: Gate 4 - the shipped course is provably winnable
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Prove a perfect player can clear the shipped obstacle pattern
+        # `dart run` and not `flutter test`: `lib/game/` imports neither Flutter
+        # nor Flame, so the prover runs on the bare VM with no widget tree.
+        #
+        # The script does two things and both matter. First it hands the prover
+        # four courses that are impossible for four different reasons and one
+        # that is trivially easy, and requires it to name the mechanism in each
+        # case — a prover that answered "fair" to everything would pass a
+        # survivability sweep while being worth nothing, so this control runs
+        # first. Then it sweeps the real pattern. `_failures` is accumulated and
+        # the script ends with an explicit `exit(_failures == 0 ? 0 : 1)`.
+        run: dart run tool/prove_fairness.dart
+
+  # ===========================================================================
+  # GATES 5 AND 6 — the test suite is graded by mutation testing
+  # ===========================================================================
+  # These two share a job on purpose. Gate 6 asks "did the suite kill the
+  # mutants?" and that question is only worth asking once gate 5 has shown the
+  # tool is *capable* of answering "no". Running them in order in one log means
+  # the proof and the result are read together.
+  mutation-testing:
+    name: Gates 5+6 - the test suite is graded by mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@v4
+
+      - name: Install the pinned Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - name: Resolve dependencies
+        # Not optional here. The mutation tool runs `flutter test --no-pub`
+        # hundreds of times and copies `.dart_tool/package_config.json` into
+        # each worker sandbox, so the package resolution has to exist on disk
+        # before it starts.
+        run: flutter pub get
+
+      - name: Prove the mutation tool can still tell its three verdicts apart
+        # THE CONTROL, AND WHY IT COMES FIRST.
+        # A mutation harness whose edits never reach the disk reports a perfect
+        # score and looks exactly like a perfect test suite. `--selftest` forces
+        # the tool to produce each verdict on demand:
+        #   POSITIVE  gravity x10, judged by the tests that watch the model
+        #                                                      -> must be KILLED
+        #   NEGATIVE  the same edit, judged only by widget_test.dart, which
+        #             never ticks the model                   -> must be SURVIVED
+        #   INVALID   a syntactically broken edit             -> must be INVALID
+        # The negative control is the one people leave out, and it is the one
+        # that rules out "always reports killed".
+        #
+        # WHY `--timeout=180` HERE WHEN THE DEFAULT IS 45.
+        # The tool counts a run that does not finish in time as a kill, and its
+        # own comments say why that is weaker evidence than a failing assertion:
+        # "did not finish" has innocent explanations. A hosted runner is slower
+        # and colder than a development laptop, and the very first `flutter test`
+        # of a run pays for compiling the whole test kernel. A short timeout
+        # there would turn the POSITIVE control into a timeout-kill and fail the
+        # self-test for a reason that has nothing to do with the code. Raising
+        # the ceiling makes each verdict rest on a real test result.
+        run: dart run tool/mutate.dart --selftest --timeout=180
+
+      - name: Prove the suite still notices deliberate breakage
+        # The stratified subset: within each operator family, evenly spaced
+        # picks covering about an eighth of it, endpoints included. Selection is
+        # index arithmetic with no randomness and no clock, so the same commit
+        # always yields the same subset and anything CI flags can be reproduced
+        # locally with `--only=<id>`. A survivor — a mutant every test passed
+        # over — exits 1.
+        #
+        # `--jobs=2` is sized for the smallest machine this can land on: a
+        # standard hosted Linux runner has 2 cores on a private repository (4 if
+        # the repository is public). Each job is a whole `flutter test` process
+        # working in its own sandbox copy of the package, so oversubscribing
+        # would not go faster; it would push every run closer to the timeout and
+        # make the verdicts mushier — and a timeout is the weakest kind of kill.
+        # Locally, on more cores, `--jobs=4` is the right number. If this
+        # repository is public, raising this to 4 is safe and roughly halves the
+        # step.
+        run: dart run tool/mutate.dart --quick --jobs=2 --timeout=180
