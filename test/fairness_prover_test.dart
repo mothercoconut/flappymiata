@@ -67,22 +67,107 @@ void main() {
 
     test('a SURVIVABLE verdict comes with inputs the real game accepts', () {
       // The strongest thing the prover can hand over: not "my search says yes"
-      // but "here are the taps, run them yourself". Twenty stretches of the real
-      // pattern, each proved and then replayed through the shipped GameModel.
+      // but "here are the taps, run them yourself". Twenty different courses,
+      // each proved and then replayed through the shipped GameModel.
+      //
+      // WHY THE VARIETY COMES FROM TWENTY SEEDS AND NOT, AS IT USED TO, FROM
+      // TWENTY WINDOWS OF ONE PATTERN: the difficulty ramp made a window's
+      // DEPTH part of what it is. `Course.fromDefaultPattern(12, 3)` is proved
+      // at obstacle 12's speed and gap height, and a fresh `GameModel` plays
+      // obstacle 0's — so replaying that witness through the game would run it
+      // against a course nobody proved. `Course.playableByGame` says so, and
+      // this test now only replays courses that claim it. Twenty seeds give the
+      // same twenty genuinely different sets of gaps with all of them anchored
+      // at obstacle 0, where the ramp has not started and the game and the
+      // prover are describing the same thing.
       for (int s = 0; s < 20; s++) {
-        final Course course = Course.fromDefaultPattern(s, 3);
+        final Course course = Course.fromSeed(s, 0, 3);
+        expect(course.playableByGame, isTrue, reason: 'seed $s');
+
         final ProofResult proof = prover.prove(course, witness: true);
-        expect(proof.survivable, isTrue, reason: 'course $s');
+        expect(proof.survivable, isTrue, reason: 'seed $s');
 
         final SimResult sim = replay(
           proof.witness!,
           start: GameModel.ready(gapCentreFor: course.asGapPattern),
         );
         expect(sim.alive, isTrue,
-            reason: 'course $s: the witness died in the real game '
+            reason: 'seed $s: the witness died in the real game '
                 '(${sim.outcome.name} at frame ${sim.frames})');
-        expect(sim.score, greaterThanOrEqualTo(3), reason: 'course $s');
+        expect(sim.score, greaterThanOrEqualTo(3), reason: 'seed $s');
       }
+    });
+
+    test('a window taken from deep in a run does NOT claim to be playable from '
+        'a fresh start', () {
+      // The guard behind the test above, asserted rather than assumed. If
+      // `playableByGame` ever went back to being true for a window that starts
+      // past the warm-up, the replay check would silently start running
+      // witnesses against the wrong course and passing.
+      expect(Course.fromDefaultPattern(0, 3).playableByGame, isTrue);
+      expect(
+        Course.fromDefaultPattern(Difficulty.plateauObstacle, 3).playableByGame,
+        isFalse,
+      );
+    });
+
+    test('the prover world tracks GameModel across the whole ramp, obstacle for '
+        'obstacle', () {
+      // The test above covers the first five obstacles, where the ramp has not
+      // started and every frame is the game that shipped before it. This one
+      // covers the part that is new, and it is the check that matters most: the
+      // prover re-implements the obstacle half of `GameModel.tick`, the ramp
+      // added THREE more moving parts to that half — a gap height per obstacle,
+      // a spacing per obstacle and a scroll speed per score — and a prover whose
+      // world drifted from the game's would certify a game nobody ships.
+      //
+      // No witness here, deliberately. Recovering one costs a snapshot of the
+      // reachable set per frame, and a run long enough to reach the plateau is
+      // thousands of frames. The car is instead flown by a plain altitude hold
+      // over mid-field gaps, which is enough to keep it alive well past the
+      // plateau — and the test asserts that it did, so a policy that started
+      // dying early would fail loudly rather than quietly checking nothing.
+      final Course course = Course.fromPattern('mid-field', (int _) => 0.5, 0, 60);
+      final CourseWorld world = CourseWorld(course);
+
+      // 0.55 rather than 0.5: an altitude hold flaps when the car is ABOVE the
+      // line, so it oscillates from the line up to about 0.112 above it. Holding
+      // at 0.55 centres that swing on 0.5, which is where the gaps are.
+      GameModel model = GameModel.ready(gapCentreFor: course.asGapPattern);
+      final Policy policy = holdAltitude(0.55);
+
+      for (int f = 0; f < 6000; f++) {
+        if (policy(model, f)) model = model.flap();
+        model = model.tick(frameSeconds);
+        world.step();
+
+        expect(model.state, RunState.playing, reason: 'the car died on frame $f');
+        expect(world.clearedSoFar, model.score,
+            reason: 'the ramp\'s own input diverged on frame $f');
+        expect(world.obstacles.length, model.obstacles.length,
+            reason: 'obstacle count diverged on frame $f');
+        for (int i = 0; i < model.obstacles.length; i++) {
+          final Obstacle real = model.obstacles[i];
+          final WorldObstacle mine = world.obstacles[i];
+          expect(mine.index, real.index, reason: 'index diverged on frame $f');
+          expect(mine.x, closeTo(real.x, 1e-12),
+              reason: 'x diverged on frame $f — the spacing or the speed ramp '
+                  'is being read at a different argument');
+          if (real.index < course.gaps.length) {
+            expect(mine.gap.centre, closeTo(real.gapCentre, 1e-12));
+            expect(mine.gap.height, closeTo(real.gapHeight, 1e-12),
+                reason: 'the gap-height ramp diverged on frame $f');
+          }
+        }
+        if (model.score > Difficulty.plateauObstacle + 4) break;
+      }
+
+      // Non-vacuous: the loop really did run past the plateau, so the
+      // comparisons above covered the warm-up, the ramp AND the plateau rather
+      // than just the flat start.
+      expect(model.score, greaterThan(Difficulty.plateauObstacle + 4),
+          reason: 'the altitude hold never got past the plateau, so nothing '
+              'beyond the warm-up was actually compared');
     });
   });
 
@@ -345,6 +430,123 @@ void main() {
           reason: 'died at frame ${r.deathFrame} on obstacle '
               '${r.deathObstacleIndex} (${r.cause?.name})');
       expect(r.obstaclesCleared, 150);
+    });
+
+    // ------------------------------------------------------------------------
+    // THE RAMPED HALF OF THE GATE.
+    //
+    // The three tests above sweep windows starting at obstacle 0, 1, 2, ... —
+    // which, now that there is a ramp, means the sweep is weighted almost
+    // entirely toward the easy start of the game. The tests below aim at the
+    // hardest setting the game can ever reach and at the run that has to get
+    // there, because a proof that only covers the warm-up is worth nothing.
+    // ------------------------------------------------------------------------
+
+    test('the ramp is bounded: it stops getting harder at the plateau', () {
+      // The property every proof below rests on. If the ramp kept tightening,
+      // "prove it at its hardest" would have no meaning — there would be no
+      // hardest — and the game would be unwinnable at SOME depth by
+      // construction.
+      final DifficultySettings top =
+          Difficulty.settingsAt(Difficulty.plateauObstacle);
+      expect(Difficulty.settingsAt(Difficulty.plateauObstacle + 1), top);
+      expect(Difficulty.settingsAt(1000000), top);
+
+      // And the hardest setting is the constants, exactly — not a value a few
+      // ulps away from them, which is what a naive lerp would produce and what
+      // would stop the report being able to state the plateau as a number.
+      expect(top.scrollSpeed, Difficulty.topScrollSpeed);
+      expect(top.gapHeight, Difficulty.tightestGapHeight);
+      expect(top.obstacleSpacing, Difficulty.tightestSpacing);
+    });
+
+    test('every 3-obstacle window AT and BEYOND the plateau is survivable', () {
+      // 400 windows starting at the plateau, and 400 more starting 5,000
+      // obstacles further in. Both stretches are at the identical, hardest
+      // difficulty — the ramp has plateaued — so the second is not "harder", it
+      // is a different sample of gap patterns at the same setting. Both are
+      // needed: the first says the ramp's endpoint is clearable, the second says
+      // that was not luck about which gaps happened to sit at obstacle 50.
+      for (final int from in <int>[
+        Difficulty.plateauObstacle,
+        Difficulty.plateauObstacle + 5000,
+      ]) {
+        final List<int> failing = <int>[];
+        for (int s = from; s < from + 400; s++) {
+          if (!prover.prove(Course.fromDefaultPattern(s, window)).survivable) {
+            failing.add(s);
+          }
+        }
+        expect(failing, isEmpty,
+            reason: 'unsurvivable windows at the plateau, from obstacle $from: '
+                '$failing');
+      }
+    });
+
+    test('the plateau keeps more than a car-height of room', () {
+      // Survivable is the bar; this is the follow-up. The shipped game before
+      // the ramp had 1.94 car-heights at its worst; the plateau was chosen to
+      // keep 1.33 over the full 10,000-window sweep that
+      // `tool/prove_fairness.dart` runs. This is a reduced version of that
+      // sweep, so the number here is a little kinder — the bar it has to clear
+      // is one car-height either way, which is exactly the bar the daily
+      // challenge is already held to.
+      double worst = double.infinity;
+      for (int s = Difficulty.plateauObstacle;
+          s < Difficulty.plateauObstacle + 60;
+          s++) {
+        final double m =
+            tightestMargin(Course.fromDefaultPattern(s, window), prover: prover);
+        if (m < worst) worst = m;
+      }
+      expect(worst, greaterThan(GameModel.carHeight),
+          reason: 'the tightest margin at the plateau is $worst, less than one '
+              'car-height — the ramp has been pushed too far');
+    });
+
+    test('a continuous run from the start line through the plateau is '
+        'survivable', () {
+      // The one that describes a real game: the reachable set is carried from
+      // `GameModel.ready` all the way through the warm-up, the ramp and 100
+      // obstacles of plateau without ever being reset. A pass means a perfect
+      // player who starts a game today is still alive at obstacle 150 WITH the
+      // ramp applied the whole way.
+      final ProofResult r = prover
+          .prove(Course.fromDefaultPattern(0, Difficulty.plateauObstacle + 100));
+      expect(r.survivable, isTrue,
+          reason: 'died at frame ${r.deathFrame} on obstacle '
+              '${r.deathObstacleIndex} (${r.cause?.name})');
+      expect(r.obstaclesCleared, Difficulty.plateauObstacle + 100);
+    });
+
+    test('the gate would notice a ramp pushed too far', () {
+      // A gate that cannot fail is not a gate. This is the ramp the game does
+      // NOT ship — 0.60 scroll speed against a 0.21 gap, which is an entirely
+      // ordinary-looking "a third faster, a quarter tighter" — and the prover
+      // has to refuse it. Without this test, every assertion above would still
+      // pass if the ramp had been bounded at some value that merely happened to
+      // be safe, and nobody would know the checks had any teeth.
+      //
+      // Obstacle 372 is where it first bites on the shipped gap pattern: six
+      // minutes into a run, which is why measuring beats playtesting here.
+      final Course tooFar = Course(
+        name: 'rejected-plateau 0.60 / 0.21',
+        gaps: List<CourseGap>.generate(
+          400,
+          (int k) => CourseGap(
+            GameModel.clampGapCentre(GameModel.defaultGapCentre(k)),
+            0.21,
+          ),
+        ),
+        difficulty: const FixedDifficulty(scrollSpeed: 0.60, spacing: 0.60),
+      );
+      final ProofResult r = prover.prove(tooFar);
+      expect(r.survivable, isFalse,
+          reason: 'the prover accepted a plateau that was rejected on purpose');
+      expect(r.cause, FailureCause.unreachable,
+          reason: 'and it has to fail for the kinematic reason, not because a '
+              'gap is geometrically too small — 0.21 still admits the car');
+      expect(r.deathObstacleIndex, lessThan(400));
     });
 
     test('the shipped pattern keeps a real margin, not a hairline one', () {

@@ -147,7 +147,88 @@ class CourseGap {
       'height: ${height.toStringAsFixed(4)})';
 }
 
-/// A finite sequence of obstacles, plus the spacing they are laid out at.
+/// How fast the world moves and how far apart the obstacles stand — the two
+/// parts of a course that are NOT properties of a single obstacle.
+///
+/// WHY THIS IS AN OBJECT RATHER THAN TWO NUMBERS ON [Course]: the shipped game
+/// ramps both with progress (see `Difficulty` in `lib/game/game_model.dart`),
+/// so "the spacing" and "the scroll speed" stopped being single values. The
+/// prover has to be able to describe a course whose speed and spacing change
+/// under it, or it would be proving things about a game nobody ships — which is
+/// the one failure mode of a prover that matters.
+///
+/// Both quantities are functions of PROGRESS and of nothing else. Neither reads
+/// a clock, and neither reads the car's position — which is what keeps the world
+/// timeline independent of the player and therefore enumerable as a fixed
+/// backdrop. See [CourseWorld].
+abstract class CourseDifficulty {
+  const CourseDifficulty();
+
+  /// Scroll speed to use on a frame that begins with [obstaclesCleared]
+  /// obstacles already behind the car.
+  ///
+  /// The argument is the count as of the END of the previous frame, because
+  /// that is exactly what `GameModel.tick` has to hand: it reads `this.score`,
+  /// which this frame's scoring has not yet touched.
+  double scrollSpeedAfter(int obstaclesCleared);
+
+  /// Distance placed between obstacle [obstacleIndex] and the one before it.
+  double spacingBefore(int obstacleIndex);
+}
+
+/// The pre-ramp world: one speed and one spacing, for ever.
+///
+/// This is what every hand-built falsification course wants — a course designed
+/// to be impossible for one specific reason should not also be moving under the
+/// prover — and it is also how a candidate plateau setting gets measured in
+/// isolation before it is written into the ramp.
+class FixedDifficulty extends CourseDifficulty {
+  /// Playfield-widths per second.
+  final double scrollSpeed;
+
+  /// Playfield-widths between consecutive obstacles.
+  final double spacing;
+
+  const FixedDifficulty({
+    this.scrollSpeed = GameModel.scrollSpeed,
+    this.spacing = GameModel.obstacleSpacing,
+  });
+
+  @override
+  double scrollSpeedAfter(int obstaclesCleared) => scrollSpeed;
+
+  @override
+  double spacingBefore(int obstacleIndex) => spacing;
+}
+
+/// The shipped ramp, evaluated at the course's own depth in the run.
+///
+/// [firstIndex] is the ABSOLUTE obstacle index of the course's first gap. It has
+/// to be carried, because the ramp is a function of how far into a run the
+/// player is and a window taken from obstacle 4000 is at obstacle 4000's
+/// difficulty — reading the ramp at the window's LOCAL index 0 would prove the
+/// easy start of the game over and over and call it a proof about the whole of
+/// it.
+///
+/// This calls straight into `Difficulty`, the same functions `GameModel.tick`
+/// calls. There is no second copy of the ramp arithmetic to drift.
+class RampedDifficulty extends CourseDifficulty {
+  /// Absolute obstacle index of the course's first gap.
+  final int firstIndex;
+
+  const RampedDifficulty(this.firstIndex);
+
+  @override
+  double scrollSpeedAfter(int obstaclesCleared) =>
+      Difficulty.scrollSpeedAt(firstIndex + obstaclesCleared);
+
+  @override
+  double spacingBefore(int obstacleIndex) =>
+      Difficulty.spacingAt(firstIndex + obstacleIndex);
+}
+
+/// A finite sequence of obstacles, plus the speed and spacing they are laid out
+/// at.
 ///
 /// A course is "cleared" when the last obstacle's right edge has passed the
 /// car's left edge — the same instant the game awards its point, and the instant
@@ -159,33 +240,49 @@ class Course {
   /// The gaps, in the order the car meets them.
   final List<CourseGap> gaps;
 
-  /// Distance between consecutive obstacles, in playfield-widths.
-  ///
-  /// Defaults to the game's own [GameModel.obstacleSpacing]. It is a parameter
-  /// only so that the falsification suite can build a course where two gaps are
-  /// too close together to be linked by any flap pattern; the shipped generator
-  /// never varies it.
-  final double spacing;
+  /// Where the world's speed and spacing come from. See [CourseDifficulty].
+  final CourseDifficulty difficulty;
 
-  /// True when this course is something the shipped game can actually produce —
-  /// the real gap heights, the real spacing, centres from the real pattern. Only
-  /// these courses can have a witness replayed through the real [GameModel].
+  /// The absolute obstacle index of `gaps[0]`, for reports.
+  final int firstIndex;
+
+  /// True when this course is something the shipped game can actually produce
+  /// FROM A FRESH START — the real gap heights, the real ramp, centres from a
+  /// real pattern, beginning at obstacle 0. Only these courses can have a
+  /// witness replayed through the real [GameModel].
+  ///
+  /// WHY IT IS NOT ENOUGH THAT THE PATTERN IS REAL, which it was before the
+  /// ramp arrived: a window taken from obstacle 4000 is proved at obstacle
+  /// 4000's speed, spacing and gap height, and a fresh `GameModel` starts at
+  /// obstacle 0's. Replaying such a witness through the game would run it
+  /// against an EASIER course than the one that was proved, and it would pass
+  /// while checking nothing.
   final bool playableByGame;
 
-  const Course({
+  /// [spacing] is a shorthand for `difficulty: FixedDifficulty(spacing: ...)`,
+  /// kept because every falsification course in the suite is stated in terms of
+  /// it: "the same two gaps, 0.20 apart" is the whole content of those courses.
+  /// Passing [difficulty] overrides it.
+  ///
+  /// Not `const` any more, and it cannot be: the default difficulty has to be
+  /// built out of the [spacing] argument, which is not a compile-time constant.
+  /// Nothing constructed one at compile time.
+  Course({
     required this.name,
     required this.gaps,
-    this.spacing = GameModel.obstacleSpacing,
+    double spacing = GameModel.obstacleSpacing,
+    CourseDifficulty? difficulty,
+    this.firstIndex = 0,
     this.playableByGame = false,
-  });
+  }) : difficulty = difficulty ?? FixedDifficulty(spacing: spacing);
 
   /// The stretch of the course produced by [pattern], starting at obstacle
   /// [firstIndex] and running for [count] obstacles.
   ///
-  /// Centres are put through [GameModel.clampGapCentre] — the same two calls,
-  /// in the same order, that `GameModel._spawnAt` makes. Heights and spacing
-  /// are the game's constants, so the result is a course the game can really
-  /// produce and a witness can really be replayed through.
+  /// Centres are put through [GameModel.clampGapCentre] — the same call
+  /// `GameModel._spawnAt` makes — and gap heights come from
+  /// [Difficulty.gapHeightAt] at the same absolute index the game would use, so
+  /// the result is the course the game really produces at that depth.
   ///
   /// WHY THIS TAKES A PATTERN RATHER THAN ONLY KNOWING ABOUT THE SHIPPED ONE:
   /// the daily challenge is a second course generator, and it has to be held to
@@ -203,10 +300,12 @@ class Course {
       count,
       (int k) => CourseGap(
         GameModel.clampGapCentre(pattern(firstIndex + k)),
-        GameModel.gapHeight,
+        Difficulty.gapHeightAt(firstIndex + k),
       ),
     ),
-    playableByGame: true,
+    difficulty: RampedDifficulty(firstIndex),
+    firstIndex: firstIndex,
+    playableByGame: firstIndex == 0,
   );
 
   /// The stretch of the shipped game's own course starting at obstacle
@@ -268,10 +367,19 @@ class WorldObstacle {
 ///
 /// obstacles move by `scrollSpeed * dt` every frame, are dropped when their right
 /// edge passes the left wall, and spawn on a cadence measured from the newest
-/// obstacle. Not one of those three rules reads the car's y, its velocity, or its
-/// score. **The world at frame T is therefore the same whatever the player does.**
+/// obstacle. Not one of those three rules reads the car's y or its velocity.
+/// **The world at frame T is therefore the same whatever the player does.**
 /// That is what lets the search treat "the pipes at frame T" as a fixed backdrop
 /// and enumerate only the car's states against it.
+///
+/// THE RAMP DOES NOT BREAK THAT, and it is worth spelling out why, because at
+/// first glance it looks as though it must: the scroll speed now depends on the
+/// SCORE, and the score is surely something the player earns. It is not. An
+/// obstacle scores when its right edge passes the car's left edge — a fact about
+/// where the pipe is, not about where the car is or how well it was flown. Every
+/// state alive at frame T has therefore passed exactly the same obstacles, so
+/// the score at frame T is a property of the world, the ramp reads a number the
+/// world already knows, and the backdrop stays fixed.
 ///
 /// This duplicates logic that lives in `GameModel.tick`, which is a real risk:
 /// if the game's spawn cadence changed and this did not, the prover would be
@@ -287,6 +395,27 @@ class CourseWorld {
   final List<WorldObstacle> _live = <WorldObstacle>[];
   int _nextIndex = 0;
   int _frame = 0;
+
+  /// Obstacles behind the car as of the END of the previous frame.
+  ///
+  /// Held rather than recomputed at the top of [step] because that is what the
+  /// game has: `GameModel.tick` scrolls the world using `this.score`, which is
+  /// last frame's answer — this frame's points have not been awarded yet. A
+  /// world that used THIS frame's count would be one frame ahead of the game on
+  /// every ramp step, and the two would drift apart by a fraction of a pixel
+  /// per obstacle for as long as a run lasted.
+  ///
+  /// IT IS A CACHE, AND READING [clearedSoFar] AT THE TOP OF [step] WOULD GIVE
+  /// THE SAME ANSWER — which is worth writing down, because it means no test can
+  /// tell the two spellings apart and somebody will eventually "fix" one into
+  /// the other. The argument: this field is assigned at the END of `step` from
+  /// `clearedSoFar`, and `_live` and `_nextIndex` are private and written
+  /// nowhere else, so nothing can change between that assignment and the top of
+  /// the next `step`. The equality is by construction rather than by
+  /// coincidence. The field is kept because it names WHICH frame's count the
+  /// scroll speed is read from, and that is the fact a reader has to be able to
+  /// check against `GameModel.tick`.
+  int _clearedLastFrame = 0;
 
   CourseWorld(this.course, {this.dt = defaultDt});
 
@@ -309,7 +438,8 @@ class CourseWorld {
   /// Advances the world one frame. Mirrors `GameModel.tick` exactly: move and
   /// drop first, then spawn at most one new obstacle.
   void step() {
-    final double travel = GameModel.scrollSpeed * dt;
+    final double travel =
+        course.difficulty.scrollSpeedAfter(_clearedLastFrame) * dt;
     final List<WorldObstacle> next = <WorldObstacle>[];
     for (final WorldObstacle o in _live) {
       final WorldObstacle moved = WorldObstacle(o.index, o.x - travel, o.gap);
@@ -320,27 +450,47 @@ class CourseWorld {
         WorldObstacle(_nextIndex, playfieldRight, _gapFor(_nextIndex)),
       );
       _nextIndex++;
-    } else if (next.last.x <= playfieldRight - course.spacing) {
-      final double x = next.last.x + course.spacing;
-      next.add(WorldObstacle(_nextIndex, x, _gapFor(_nextIndex)));
-      _nextIndex++;
+    } else {
+      // Read once and reused for both the test and the placement, exactly as
+      // `GameModel.tick` does. Two calls would be two chances for the ramp to
+      // be sampled at different arguments.
+      final double spacing = course.difficulty.spacingBefore(_nextIndex);
+      if (next.last.x <= playfieldRight - spacing) {
+        next.add(
+          WorldObstacle(_nextIndex, next.last.x + spacing, _gapFor(_nextIndex)),
+        );
+        _nextIndex++;
+      }
     }
     _live
       ..clear()
       ..addAll(next);
     _frame++;
+    _clearedLastFrame = clearedSoFar;
   }
 
-  /// How many of the course's obstacles have gone fully behind the car.
+  /// How many obstacles have gone fully behind the car, NOT capped by the
+  /// length of the course.
   ///
   /// Counted from the left-most obstacle still alive: everything with a smaller
   /// index has already been dropped, and dropping happens long after passing.
-  int get obstaclesCleared {
+  ///
+  /// This is the number the game calls `score`, and it is the ramp's input, so
+  /// it must not be capped: past the end of a short course the world keeps
+  /// spawning on cadence, and capping here would freeze the ramp at a difficulty
+  /// the game would have moved on from.
+  int get clearedSoFar {
     final double carLeft = GameModel.carX - GameModel.carWidth / 2;
     int cleared = _nextIndex;
     for (final WorldObstacle o in _live) {
       if (o.right >= carLeft && o.index < cleared) cleared = o.index;
     }
+    return cleared;
+  }
+
+  /// How many of the COURSE's obstacles have gone fully behind the car.
+  int get obstaclesCleared {
+    final int cleared = clearedSoFar;
     return cleared > course.gaps.length ? course.gaps.length : cleared;
   }
 
@@ -1008,10 +1158,20 @@ double tightestMargin(
 /// the number that makes a lone obstacle harder than its height suggests: the
 /// car does not have to fit through the gap, it has to STAY inside it for this
 /// many frames while gravity keeps working.
-int obstacleOverlapFrames({double dt = defaultDt}) {
+///
+/// [scrollSpeed] is a parameter because the ramp moves it. The window is
+/// `(carWidth + obstacleWidth) / scrollSpeed` seconds wide, so a faster world
+/// pins the car for FEWER frames — which is the one way in which speeding the
+/// game up makes a single obstacle easier rather than harder, and the reason the
+/// gap can be narrowed further at the plateau than it could be at the start.
+int obstacleOverlapFrames({
+  double dt = defaultDt,
+  double scrollSpeed = GameModel.scrollSpeed,
+}) {
   final Course probe = Course(
     name: 'probe',
     gaps: const <CourseGap>[CourseGap(0.5, GameModel.gapHeight)],
+    difficulty: FixedDifficulty(scrollSpeed: scrollSpeed),
   );
   final CourseWorld world = CourseWorld(probe, dt: dt);
   final double carLeft = GameModel.carX - GameModel.carWidth / 2;

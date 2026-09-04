@@ -17,6 +17,17 @@
 ///           two-year range. Same searches, same epsilon, same course factory —
 ///           a second generator held to the first one's standard of evidence
 ///           rather than to a new one written for the occasion.
+///   PART 6  aims all of it at the DIFFICULTY RAMP: the ramp's shape, a proof
+///           at and beyond the setting it plateaus at, and the ramps that were
+///           measured and rejected.
+///
+/// WHY PART 6 EXISTS AND IS NOT JUST MORE OF PART 4: before the ramp, every
+/// window of the shipped pattern was played at the same speed with the same gap,
+/// so "sweep 10,000 windows" covered the whole game. It no longer does. A sweep
+/// that starts at obstacle 0, 1, 2, ... is a sweep of the EASY START, ten
+/// thousand times over, and it would go green over a plateau that is unwinnable.
+/// The obstacle the ramp stops at is the number to point a prover at, and Part 6
+/// is where that happens.
 ///
 /// Exit code 0 means every expectation held.
 library;
@@ -64,7 +75,8 @@ void main(List<String> args) {
       '${prover.epsilon.toStringAsExponential(0)}  (errs toward calling a fair '
       'course unfair — see tool/fairness.dart)');
   stdout.writeln('  carHeight          ${GameModel.carHeight}');
-  stdout.writeln('  gapHeight          ${GameModel.gapHeight}');
+  stdout.writeln('  gapHeight          ${GameModel.gapHeight}  '
+      '(at the START of a run; the ramp narrows it — see PART 6)');
   stdout.writeln('  static gap slack   '
       '${(GameModel.gapHeight - GameModel.carHeight).toStringAsFixed(4)}'
       '  (a lone obstacle can never be unfair; only transitions can)');
@@ -73,6 +85,7 @@ void main(List<String> args) {
   _part4Windows(prover, courses, window, sample);
   if (continuous > 0) _part4Continuous(prover, continuous);
   if (dates > 0) _part5Daily(prover, 2024, 1, 1, dates, window);
+  _part6Ramp(prover, courses, window, continuous, dates);
 
   total.stop();
   stdout.writeln('');
@@ -364,6 +377,15 @@ void _part4Windows(
   stdout.writeln('  transitions between gaps can be — and a window of $window '
       'contains them.');
   stdout.writeln('');
+  stdout.writeln('  EACH WINDOW IS PROVED AT ITS OWN DEPTH ON THE RAMP: window '
+      's uses the speed,');
+  stdout.writeln('  spacing and gap height the game gives obstacle s, not the '
+      'ones it gives');
+  stdout.writeln('  obstacle 0. But s = 0..${courseCount - 1} is still mostly '
+      'the easy start of the');
+  stdout.writeln('  game repeated, so this sweep is NOT a proof about the '
+      'plateau. PART 6 is.');
+  stdout.writeln('');
 
   final Stopwatch clock = Stopwatch()..start();
   final int callsBefore = prover.proveCalls;
@@ -456,7 +478,13 @@ void _part4Continuous(FairnessProver prover, int obstacles) {
     'Stronger than 4a and not a substitute for it. Here the reachable set is\n'
     'carried across the WHOLE pattern without ever being reset, so a pass means\n'
     'a perfect player who starts a real game can still be alive at obstacle\n'
-    '$obstacles — not merely that each stretch is clearable from a fresh start.\n',
+    '$obstacles — not merely that each stretch is clearable from a fresh start.\n'
+    '\n'
+    'THIS IS ALSO THE ONLY PART THAT DESCRIBES THE RAMP END TO END. The run\n'
+    'starts at obstacle 0 with the shipped tuning, climbs the ramp, and spends\n'
+    'the remaining ${obstacles - Difficulty.plateauObstacle} obstacles at the '
+    'plateau — one search, one game, no\n'
+    'resets and no hand-off between difficulty settings.\n',
   );
 
   final Course course = Course.fromDefaultPattern(0, obstacles);
@@ -599,6 +627,326 @@ void _part5Daily(
   }
   if (worstMargin <= GameModel.carHeight) {
     _fail('the tightest daily margin is $worstMargin, under one car height');
+  }
+}
+
+// =============================================================================
+// PART 6 — the difficulty ramp
+// =============================================================================
+
+/// Proves the ramp, which means proving it AT ITS HARDEST and past there.
+///
+/// THE FAILURE THIS PART EXISTS TO PREVENT, stated plainly: a ramp is a promise
+/// that the game gets harder, and a fairness proof is a promise that it stays
+/// winnable. Those two promises pull against each other, and the place they
+/// break is deep in a run — obstacle 300, obstacle 400 — where no playtest goes.
+/// A ramp tuned by feel can therefore be unwinnable and feel excellent, because
+/// the part anybody plays is the part that got better.
+///
+/// So the ramp is not tuned here, it is bounded here. The plateau is the one
+/// hardest setting the game can ever reach; everything below points the existing
+/// prover at it.
+void _part6Ramp(
+  FairnessProver prover,
+  int courseCount,
+  int window,
+  int continuous,
+  int dates,
+) {
+  _banner('PART 6 — the difficulty ramp, proved at and beyond its plateau');
+
+  // ---- 6a: what the ramp is -------------------------------------------------
+  stdout.writeln('THE RAMP');
+  stdout.writeln('  driven by              obstacles passed — a pure function of '
+      'progress, with');
+  stdout.writeln('                         no clock and no randomness, so a '
+      'recorded run replays');
+  stdout.writeln('                         frame-exactly INCLUDING its '
+      'difficulty');
+  stdout.writeln('  warm-up                obstacles 0..${Difficulty.warmUpObstacles} '
+      '(the shipped tuning, unchanged)');
+  stdout.writeln('  ramps over             ${Difficulty.rampObstacles} obstacles');
+  stdout.writeln('  PLATEAUS AT            obstacle ${Difficulty.plateauObstacle}'
+      '  <- the hardest setting the game has');
+  stdout.writeln('');
+  stdout.writeln('  progress   scrollSpeed   gapHeight   spacing   '
+      'gap in car-heights');
+  for (final int p in <int>[
+    0,
+    Difficulty.warmUpObstacles,
+    Difficulty.warmUpObstacles + Difficulty.rampObstacles ~/ 4,
+    Difficulty.warmUpObstacles + Difficulty.rampObstacles ~/ 2,
+    Difficulty.plateauObstacle - 1,
+    Difficulty.plateauObstacle,
+    Difficulty.plateauObstacle + 1,
+    100000,
+  ]) {
+    final DifficultySettings s = Difficulty.settingsAt(p);
+    stdout.writeln('  ${p.toString().padLeft(8)}   '
+        '${s.scrollSpeed.toStringAsFixed(6).padLeft(11)}   '
+        '${s.gapHeight.toStringAsFixed(6).padLeft(9)}   '
+        '${s.obstacleSpacing.toStringAsFixed(4).padLeft(7)}   '
+        '${(s.gapHeight / GameModel.carHeight).toStringAsFixed(2).padLeft(6)}');
+  }
+
+  // The plateau has to BE a plateau. Everything below is a proof about one
+  // setting, and that is only worth anything if the game cannot get past it.
+  final DifficultySettings top =
+      Difficulty.settingsAt(Difficulty.plateauObstacle);
+  if (Difficulty.settingsAt(Difficulty.plateauObstacle + 1) != top ||
+      Difficulty.settingsAt(1 << 40) != top) {
+    _fail('the ramp does not plateau — a proof at obstacle '
+        '${Difficulty.plateauObstacle} says nothing about obstacle 10,000');
+  }
+  if (top.scrollSpeed != Difficulty.topScrollSpeed ||
+      top.gapHeight != Difficulty.tightestGapHeight ||
+      top.obstacleSpacing != Difficulty.tightestSpacing) {
+    _fail('the settings at the plateau are not the plateau constants; the '
+        'report above is describing a game that is not being proved');
+  }
+
+  // ---- 6b: what the plateau costs, in physics ------------------------------
+  final int baseOverlap =
+      obstacleOverlapFrames(scrollSpeed: GameModel.scrollSpeed);
+  final int topOverlap =
+      obstacleOverlapFrames(scrollSpeed: Difficulty.topScrollSpeed);
+  final double baseFloor =
+      GameModel.carHeight + minimumExcursion(baseOverlap).excursion;
+  final double topFloor =
+      GameModel.carHeight + minimumExcursion(topOverlap).excursion;
+
+  stdout.writeln('');
+  stdout.writeln('WHAT THE PLATEAU CHANGES, in numbers computed without the '
+      'prover');
+  stdout.writeln('                            start     plateau');
+  stdout.writeln('  approach time (s)         '
+      '${((playfieldRight - GameModel.carX) / GameModel.scrollSpeed).toStringAsFixed(3)}     '
+      '${((playfieldRight - GameModel.carX) / Difficulty.topScrollSpeed).toStringAsFixed(3)}');
+  stdout.writeln('  obstacle cadence (s)      '
+      '${(GameModel.obstacleSpacing / GameModel.scrollSpeed).toStringAsFixed(3)}     '
+      '${(Difficulty.tightestSpacing / Difficulty.topScrollSpeed).toStringAsFixed(3)}');
+  stdout.writeln('  free air between pipes    '
+      '${((GameModel.obstacleSpacing - GameModel.carWidth - GameModel.obstacleWidth) / GameModel.scrollSpeed).toStringAsFixed(3)}     '
+      '${((Difficulty.tightestSpacing - GameModel.carWidth - GameModel.obstacleWidth) / Difficulty.topScrollSpeed).toStringAsFixed(3)}'
+      '   <- what a worst-case climb is paid out of');
+  stdout.writeln('  overlap window (frames)   '
+      '${baseOverlap.toString().padLeft(5)}     ${topOverlap.toString().padLeft(5)}'
+      '   <- shorter, so a lone gap gets EASIER');
+  stdout.writeln('  lone-obstacle floor       '
+      '${baseFloor.toStringAsFixed(3)}     ${topFloor.toStringAsFixed(3)}'
+      '   <- a single gap below this is impossible');
+  stdout.writeln('  gap height                '
+      '${GameModel.gapHeight.toStringAsFixed(3)}     '
+      '${Difficulty.tightestGapHeight.toStringAsFixed(3)}');
+  if (Difficulty.tightestGapHeight <= topFloor) {
+    _fail('the plateau gap (${Difficulty.tightestGapHeight}) is at or below the '
+        'lone-obstacle floor ($topFloor): every obstacle past the plateau is '
+        'impossible on its own');
+  } else {
+    stdout.writeln('  OK — the plateau gap clears its own floor by '
+        '${(Difficulty.tightestGapHeight - topFloor).toStringAsFixed(4)}, so no '
+        'single obstacle is impossible.');
+    stdout.writeln('       That is necessary and NOT sufficient: what follows '
+        'is about transitions.');
+  }
+
+  // ---- 6c: the sweep at and beyond the plateau -----------------------------
+  //
+  // Two blocks, and the second is not "harder" than the first — the ramp has
+  // stopped, so both are the identical setting. It is a second sample of the gap
+  // pattern at that setting, which is what stops the first block passing by
+  // luck about which gaps happen to sit around obstacle 50.
+  final int perBlock = courseCount ~/ 2 < 1 ? 1 : courseCount ~/ 2;
+  for (final int from in <int>[
+    Difficulty.plateauObstacle,
+    Difficulty.plateauObstacle + 5000,
+  ]) {
+    final Stopwatch clock = Stopwatch()..start();
+    final List<int> failing = <int>[];
+    double worst = double.infinity;
+    int worstAt = -1;
+    for (int s = from; s < from + perBlock; s++) {
+      final Course c = Course.fromDefaultPattern(s, window);
+      // Same beat-the-incumbent shortcut Part 4a uses: a course that clears at
+      // the current worst margin cannot be the new worst, so one search settles
+      // it and only a real candidate is bisected.
+      if (worstAt >= 0 && prover.prove(c, inflate: worst).survivable) continue;
+      if (!prover.prove(c).survivable) {
+        failing.add(s);
+        continue;
+      }
+      final double m = tightestMargin(c,
+          prover: prover, upper: worstAt < 0 ? 0.2 : worst);
+      if (m < worst) {
+        worst = m;
+        worstAt = s;
+      }
+    }
+    clock.stop();
+
+    stdout.writeln('');
+    stdout.writeln('  $perBlock windows of $window obstacles from obstacle '
+        '$from  (ramp fraction '
+        '${Difficulty.rampFraction(from).toStringAsFixed(1)})');
+    stdout.writeln('    PASS (survivable)    ${perBlock - failing.length}');
+    stdout.writeln('    FAIL (unsurvivable)  ${failing.length}'
+        '${failing.isEmpty ? "" : "  ${failing.take(10).toList()}"}');
+    if (worstAt >= 0) {
+      stdout.writeln('    worst margin         ${worst.toStringAsFixed(5)}  '
+          '(${(worst / GameModel.carHeight).toStringAsFixed(2)} car-heights) '
+          'at obstacle $worstAt');
+    }
+    stdout.writeln('    wall time            '
+        '${(clock.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
+
+    if (failing.isNotEmpty) {
+      _fail('${failing.length} window(s) at the plateau (from obstacle $from) '
+          'are unsurvivable — the ramp has been pushed past what the game can '
+          'honour');
+    }
+    // The same bar the daily challenge is already held to. Survivable by a
+    // hairline is technically fair and unplayable, and a ramp is exactly the
+    // feature that would produce one.
+    if (worstAt >= 0 && worst <= GameModel.carHeight) {
+      _fail('the tightest margin at the plateau is $worst, under one car '
+          'height (${GameModel.carHeight})');
+    }
+  }
+
+  // ---- 6d: a continuous run that goes THROUGH the ramp ----------------------
+  //
+  // Part 4b already does this for `continuous` obstacles and is the strongest
+  // statement in the whole report. Repeated here only as a short, explicit
+  // "the plateau is reachable by playing", because 4b's headline is about the
+  // gap pattern rather than about the ramp.
+  final int reach = Difficulty.plateauObstacle + 100;
+  final ProofResult through = prover.prove(Course.fromDefaultPattern(0, reach));
+  stdout.writeln('');
+  stdout.writeln('  one run from the start line to obstacle $reach '
+      '(warm-up, ramp, then 100 of plateau)');
+  stdout.writeln('    verdict              '
+      '${through.survivable ? "SURVIVABLE" : "UNSURVIVABLE"}');
+  stdout.writeln('    obstacles cleared    ${through.obstaclesCleared}');
+  if (!through.survivable) {
+    stdout.writeln('    died at              frame ${through.deathFrame}, '
+        'obstacle ${through.deathObstacleIndex}, ${through.cause?.name}');
+    _fail('a run that climbs the ramp cannot reach the plateau');
+  }
+
+  // ---- 6e: the ramps that were rejected ------------------------------------
+  //
+  // The falsification half, and the reason Part 3 runs before Part 4: a proof
+  // that the shipped ramp is fair is worth nothing unless the same machinery
+  // would have refused an unfair one. These three are real candidates that were
+  // measured during design, and every one of them looks perfectly reasonable
+  // written down.
+  stdout.writeln('');
+  stdout.writeln('  RAMPS THAT WERE MEASURED AND REJECTED');
+  stdout.writeln('  Each is a plateau somebody could plausibly have shipped — '
+      '"a third faster and');
+  stdout.writeln('  a quarter tighter" is not an outrageous thing to write. '
+      'Each is held fixed at');
+  stdout.writeln('  that setting and windows of the shipped gap pattern are '
+      'swept from obstacle 0');
+  stdout.writeln('  until one is refused. The index printed is the first '
+      'obstacle at which that');
+  stdout.writeln('  ramp hands a player a course NOTHING can get past — and '
+      'note how deep some');
+  stdout.writeln('  of them are. That depth is the whole reason this is '
+      'measured and not felt.');
+
+  const List<List<double>> rejected = <List<double>>[
+    <double>[0.60, 0.21, 0.60],
+    <double>[0.5625, 0.22, 0.60],
+    <double>[0.54, 0.23, 0.54],
+  ];
+  const int rejectScan = 2500;
+  for (final List<double> candidate in rejected) {
+    final double speed = candidate[0];
+    final double gap = candidate[1];
+    final double spacing = candidate[2];
+    final CourseDifficulty held =
+        FixedDifficulty(scrollSpeed: speed, spacing: spacing);
+
+    int firstBad = -1;
+    FailureCause? cause;
+    for (int s = 0; s < rejectScan && firstBad < 0; s++) {
+      final Course c = Course(
+        name: 'rejected[$s]',
+        gaps: List<CourseGap>.generate(
+          window,
+          (int k) => CourseGap(
+            GameModel.clampGapCentre(GameModel.defaultGapCentre(s + k)),
+            gap,
+          ),
+        ),
+        difficulty: held,
+        firstIndex: s,
+      );
+      final ProofResult r = prover.prove(c);
+      if (!r.survivable) {
+        firstBad = s;
+        cause = r.cause;
+      }
+    }
+
+    stdout.writeln('    speed $speed  gap $gap  spacing $spacing   '
+        '${firstBad < 0 ? "no wall found in $rejectScan windows" : "WALL at "
+            "obstacle $firstBad (${cause?.name})"}');
+    if (firstBad < 0) {
+      _fail('a plateau rejected during design produced no unsurvivable window '
+          'in $rejectScan tries; either the prover or the design note is wrong, '
+          'and neither can be trusted until that is settled');
+    }
+  }
+  stdout.writeln('    shipped: speed ${Difficulty.topScrollSpeed}  '
+      'gap ${Difficulty.tightestGapHeight}  '
+      'spacing ${Difficulty.tightestSpacing}   '
+      '- no wall, proved above');
+
+  // ---- 6f: the daily challenge, at the plateau ------------------------------
+  //
+  // Part 5 sweeps every date at obstacle 0, which is now the easy start. A daily
+  // course nobody chose has to be fair at the HARD end too, and it is a
+  // different set of gaps for every date, so it gets its own pass.
+  if (dates > 0) {
+    final int deepDates = dates < 120 ? dates : 120;
+    final DateTime first = DateTime.utc(2024, 1, 1);
+    final List<String> failing = <String>[];
+    double worst = double.infinity;
+    String worstDate = '';
+    for (int n = 0; n < deepDates; n++) {
+      final DateTime d = first.add(Duration(days: n));
+      final int seed = dailySeed(d.year, d.month, d.day);
+      final Course c =
+          Course.fromSeed(seed, Difficulty.plateauObstacle, window);
+      if (!prover.prove(c).survivable) {
+        failing.add(d.toIso8601String().substring(0, 10));
+      } else if (n % 10 == 0) {
+        final double m = tightestMargin(c, prover: prover);
+        if (m < worst) {
+          worst = m;
+          worstDate = d.toIso8601String().substring(0, 10);
+        }
+      }
+    }
+    stdout.writeln('');
+    stdout.writeln('  $deepDates daily courses, each read from obstacle '
+        '${Difficulty.plateauObstacle} (i.e. at the plateau)');
+    stdout.writeln('    PASS (survivable)    ${deepDates - failing.length}');
+    stdout.writeln('    FAIL (unsurvivable)  ${failing.length}'
+        '${failing.isEmpty ? "" : "  ${failing.take(10).toList()}"}');
+    stdout.writeln('    tightest margin      ${worst.toStringAsFixed(5)} on '
+        '$worstDate  (${(worst / GameModel.carHeight).toStringAsFixed(2)} '
+        'car-heights)');
+    if (failing.isNotEmpty) {
+      _fail('unsurvivable daily courses at the plateau: '
+          '${failing.take(10).join(", ")}');
+    }
+    if (worst <= GameModel.carHeight) {
+      _fail('the tightest daily margin at the plateau is $worst, under one car '
+          'height');
+    }
   }
 }
 

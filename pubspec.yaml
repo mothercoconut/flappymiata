@@ -36,6 +36,22 @@ dependencies:
   cupertino_icons: ^1.0.8
   flame: ^1.38.2
 
+  # The ONE dependency added for high-score persistence, and the reason it is
+  # here rather than a file written by hand:
+  #
+  # Storing a score needs a directory that is writable and that survives an app
+  # update, and on Android and iOS the only way to learn where that is, is to
+  # ask the platform over a method channel. So "just write a file" is not
+  # dependency-free — it is `path_provider` PLUS the encoding, the atomic write
+  # and the corrupt-file handling. This is one package instead of one package
+  # and a pile of code, it is maintained by the Flutter team, and what is being
+  # stored is a single short string.
+  #
+  # Nothing in `lib/game/` imports it, and nothing may: that directory is pure
+  # Dart with no I/O, which is what makes the model replayable and its fairness
+  # provable. See `lib/ui/high_score_store.dart`.
+  shared_preferences: ^2.2.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
