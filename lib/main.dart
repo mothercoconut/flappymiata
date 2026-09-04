@@ -16,9 +16,12 @@
 /// finished.
 library;
 
+import 'dart:ui' as ui;
+
 import 'package:flame/components.dart';
 import 'package:flame/events.dart';
 import 'package:flame/game.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
 import 'package:flappymiata/game/game_model.dart';
@@ -116,9 +119,8 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
 
   late final _ScorePanel _panel;
 
-  /// Flat fill, painted before any component draws. No gradient, on purpose.
   @override
-  Color backgroundColor() => const Color(0xFF0B2545);
+  Color backgroundColor() => const Color(0xFF10233F);
 
   @override
   Future<void> onLoad() async {
@@ -129,7 +131,7 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
     // carry are what actually decide who covers whom, so swapping these two
     // entries changes nothing on screen — which is the point of using
     // priorities rather than insertion order.
-    await addAll(<Component>[_WorldLayer(), _panel]);
+    await addAll(<Component>[_BackdropLayer(), _WorldLayer(), _panel]);
 
     // So the "tap to start" hint is on screen for the very first frame, rather
     // than appearing only once `update` has run once.
@@ -185,29 +187,162 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
 /// model already owns those objects; mirroring them into a component tree would
 /// mean adding and removing components sixty times a second in order to display
 /// data that is already sitting in a field.
-class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
-  _WorldLayer() : super(priority: _worldPriority);
+class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
+  _BackdropLayer() : super(priority: -100);
 
-  /// One flat colour for every pipe, scored or not. A second colour here would
-  /// be a presentation decision, and presentation is `lib/ui/`'s to make.
-  static final Paint _pipePaint = Paint()..color = const Color(0xFF3DDC84);
-
-  /// The car. A rectangle, not a sprite: what is drawn is exactly the box that
-  /// collision is tested against, so a near miss that looks like a hit is one.
-  static final Paint _carPaint = Paint()..color = const Color(0xFFE23D28);
+  static final Paint _sky = Paint()
+    ..shader = ui.Gradient.linear(
+      const Offset(0, 0),
+      const Offset(0, 900),
+      const <Color>[Color(0xFF173B62), Color(0xFF4C7E92)],
+    );
+  static final Paint _horizon = Paint()..color = const Color(0xFF78A88D);
+  static final Paint _hill = Paint()..color = const Color(0xFF5F9B8A);
+  static final Paint _cloud = Paint()..color = const Color(0xB8F4FBF4);
+  static final Paint _ground = Paint()..color = const Color(0xFF264B3D);
 
   @override
   void render(Canvas canvas) {
+    final Size size = game.size.toSize();
+    canvas.drawRect(Offset.zero & size, _sky);
+    final Path hills = Path()
+      ..moveTo(0, size.height * 0.70)
+      ..lineTo(size.width * 0.16, size.height * 0.57)
+      ..lineTo(size.width * 0.31, size.height * 0.70)
+      ..lineTo(size.width * 0.49, size.height * 0.53)
+      ..lineTo(size.width * 0.68, size.height * 0.70)
+      ..lineTo(size.width * 0.84, size.height * 0.59)
+      ..lineTo(size.width, size.height * 0.70)
+      ..close();
+    canvas.drawPath(hills, _hill);
+    _drawCloud(canvas, Offset(size.width * 0.20, size.height * 0.18), 0.9);
+    _drawCloud(canvas, Offset(size.width * 0.76, size.height * 0.29), 0.65);
+    canvas.drawRect(
+      Rect.fromLTWH(0, size.height * 0.70, size.width, size.height * 0.06),
+      _horizon,
+    );
+    canvas.drawRect(
+      Rect.fromLTWH(0, size.height * 0.76, size.width, size.height * 0.24),
+      _ground,
+    );
+  }
+
+  void _drawCloud(Canvas canvas, Offset center, double scale) {
+    final double width = 104 * scale;
+    final double height = 24 * scale;
+    final RRect cloud = RRect.fromRectAndRadius(
+      Rect.fromCenter(center: center, width: width, height: height),
+      Radius.circular(height / 2),
+    );
+    canvas.drawRRect(cloud, _cloud);
+    canvas.drawCircle(
+      center.translate(-width * 0.20, -height * 0.22),
+      height * 0.65,
+      _cloud,
+    );
+    canvas.drawCircle(
+      center.translate(width * 0.12, -height * 0.34),
+      height * 0.82,
+      _cloud,
+    );
+  }
+}
+
+class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
+  _WorldLayer() : super(priority: _worldPriority);
+
+  static const double _miataVisualHeightScale = 1.885;
+  static const double _pipeCapHeight = 44.0;
+
+  static final Paint _pipeOutline = Paint()..color = const Color(0xFF153D2B);
+  static final Paint _pipeBody = Paint()..color = const Color(0xFF2D7A4A);
+  static final Paint _pipeHighlight = Paint()..color = const Color(0xFF65B96C);
+  static final Paint _pipeShadow = Paint()..color = const Color(0xFF205A3A);
+  ui.Image? _miataImage;
+
+  @override
+  Future<void> onLoad() async {
+    await super.onLoad();
+    final ByteData data = await rootBundle.load(
+      'assets/sprites/miatasprite.png',
+    );
+    final ui.Codec codec = await ui.instantiateImageCodec(
+      data.buffer.asUint8List(),
+    );
+    _miataImage = (await codec.getNextFrame()).image;
+    codec.dispose();
+  }
+
+  @override
+  void render(Canvas canvas) {
+    final ui.Image? miataImage = _miataImage;
+    if (miataImage == null) return;
+
     for (final Obstacle obstacle in game.model.obstacles) {
-      // Drawing the model's own `topBox` and `bottomBox` rather than working
-      // the rectangles out again here. Recomputed geometry can disagree with
-      // the geometry collision uses and still look convincing on screen; taking
-      // the boxes straight from the model makes that disagreement impossible.
-      canvas.drawRect(_toPixels(obstacle.topBox), _pipePaint);
-      canvas.drawRect(_toPixels(obstacle.bottomBox), _pipePaint);
+      _drawPipe(canvas, _toPixels(obstacle.topBox), capAtBottom: true);
+      _drawPipe(canvas, _toPixels(obstacle.bottomBox));
     }
 
-    canvas.drawRect(_toPixels(game.model.carBox), _carPaint);
+    final Rect carRect = _toPixels(game.model.carBox);
+    final double visualHeight = carRect.height * _miataVisualHeightScale;
+    final double visualWidth = visualHeight * miataImage.width / miataImage.height;
+    final Rect visualRect = Rect.fromCenter(
+      center: carRect.center,
+      width: visualWidth,
+      height: visualHeight,
+    );
+    canvas.drawImageRect(
+      miataImage,
+      Rect.fromLTWH(
+        0,
+        0,
+        miataImage.width.toDouble(),
+        miataImage.height.toDouble(),
+      ),
+      visualRect,
+      Paint(),
+    );
+  }
+
+  void _drawPipe(Canvas canvas, Rect box, {bool capAtBottom = false}) {
+    final double capHeight = _pipeCapHeight.clamp(0, box.height);
+    final Rect body = capAtBottom
+        ? Rect.fromLTRB(box.left, box.top, box.right, box.bottom - capHeight)
+        : Rect.fromLTRB(box.left, box.top + capHeight, box.right, box.bottom);
+    final Rect cap = capAtBottom
+        ? Rect.fromLTRB(box.left, box.bottom - capHeight, box.right, box.bottom)
+        : Rect.fromLTRB(box.left, box.top, box.right, box.top + capHeight);
+
+    canvas.drawRect(body, _pipeOutline);
+    canvas.drawRect(body.deflate(5), _pipeBody);
+    canvas.drawRect(
+      Rect.fromLTRB(body.left + 7, body.top, body.left + 13, body.bottom),
+      _pipeHighlight,
+    );
+    canvas.drawRect(
+      Rect.fromLTRB(body.right - 12, body.top, body.right - 5, body.bottom),
+      _pipeShadow,
+    );
+    canvas.drawRect(cap, _pipeOutline);
+    canvas.drawRect(cap.deflate(5), _pipeBody);
+    final Rect capHighlight = capAtBottom
+        ? Rect.fromLTRB(cap.left + 8, cap.top + 7, cap.right - 8, cap.top + 14)
+        : Rect.fromLTRB(
+            cap.left + 8,
+            cap.bottom - 14,
+            cap.right - 8,
+            cap.bottom - 7,
+          );
+    canvas.drawRect(capHighlight, _pipeHighlight);
+    final Rect opening = capAtBottom
+        ? Rect.fromLTRB(cap.left + 11, cap.top + 16, cap.right - 11, cap.top + 25)
+        : Rect.fromLTRB(
+            cap.left + 11,
+            cap.bottom - 25,
+            cap.right - 11,
+            cap.bottom - 16,
+          );
+    canvas.drawRect(opening, _pipeShadow);
   }
 
   /// THE ONE CONVERSION THE MODEL REFUSES TO DO: a normalised box — 0..1 on
@@ -247,7 +382,8 @@ class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
 /// stay hard to read even once they are unmistakably in front. An opaque
 /// rectangle underneath makes the colour behind the text a known quantity no
 /// matter what is passing beneath it.
-class _ScorePanel extends PositionComponent {
+class _ScorePanel extends PositionComponent
+  with HasGameReference<FlappyMiataGame> {
   _ScorePanel()
     : super(
         // Pushed down from the top edge rather than starting at y = 0: on a
@@ -266,7 +402,12 @@ class _ScorePanel extends PositionComponent {
   /// rectangle is that pipe colour cannot show through it. Anything below full
   /// alpha quietly reintroduces the unreadable-score problem, and it would only
   /// show up in the handful of frames a pipe spends behind the text.
-  static final Paint _backing = Paint()..color = const Color(0xFF06172E);
+  static final Paint _backing = Paint()..color = const Color(0xE812263D);
+  static final Paint _cardBacking = Paint()..color = const Color(0xF20A1D32);
+  static final Paint _cardBorder = Paint()
+    ..color = const Color(0xFF8BD3C7)
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 3;
 
   /// Added as a CHILD rather than drawn inside [render], because Flame draws a
   /// component's children after the component itself. That is the same
@@ -279,6 +420,19 @@ class _ScorePanel extends PositionComponent {
         color: Color(0xFFFFFFFF),
         fontSize: 20.0,
         height: 1.4,
+      ),
+    ),
+  );
+
+  final TextComponent _stateReadout = TextComponent(
+    anchor: Anchor.center,
+    textRenderer: TextPaint(
+      style: const TextStyle(
+        color: Color(0xFFFFFFFF),
+        fontSize: 26.0,
+        fontWeight: FontWeight.w800,
+        height: 1.25,
+        letterSpacing: 1.5,
       ),
     ),
   );
@@ -297,26 +451,54 @@ class _ScorePanel extends PositionComponent {
   /// changes only when the score or the state does. Re-laying-out a paragraph
   /// sixty times a second to arrive at the same pixels is work nobody sees.
   set text(String value) {
-    if (_readout.text == value) return;
-    _readout.text = value;
-    size.setValues(
-      _readout.size.x + _padding * 2,
-      _readout.size.y + _padding * 2,
-    );
+    if (_readout.text != value) {
+      _readout.text = value;
+      size.setValues(
+        _readout.size.x + _padding * 2,
+        _readout.size.y + _padding * 2,
+      );
+    }
+    switch (game.model.state) {
+      case RunState.ready:
+        _stateReadout.text = 'READY\nTAP TO DRIVE';
+      case RunState.playing:
+        _stateReadout.text = '';
+      case RunState.dead:
+        _stateReadout.text = 'RUN OVER\nTAP TO RESTART';
+    }
   }
 
   @override
   Future<void> onLoad() async {
     await super.onLoad();
-    await add(_readout);
+    await addAll(<Component>[_readout, _stateReadout]);
   }
 
   @override
   void render(Canvas canvas) {
-    // Local coordinates: PositionComponent has already applied this panel's own
-    // translation, so (0, 0) here is the panel's top-left corner. Size stays
-    // zero until the first `text` set, and a zero-sized rect draws nothing —
-    // which is the right thing to show before there is anything to say.
-    canvas.drawRect(Rect.fromLTWH(0, 0, size.x, size.y), _backing);
+    final RRect scoreRect = RRect.fromRectAndRadius(
+      Rect.fromLTWH(0, 0, size.x, size.y),
+      const Radius.circular(10),
+    );
+    canvas.drawRRect(scoreRect.shift(const Offset(0, 4)), _cardBorder);
+    canvas.drawRRect(scoreRect, _backing);
+
+    if (game.model.state == RunState.playing) return;
+
+    _stateReadout.position = Vector2(game.size.x / 2, game.size.y * 0.42);
+    final double cardWidth = game.size.x * 0.72;
+    final double cardHeight = 116;
+    final Rect cardRect = Rect.fromLTWH(
+      (game.size.x - cardWidth) / 2,
+      game.size.y * 0.33,
+      cardWidth,
+      cardHeight,
+    );
+    final RRect card = RRect.fromRectAndRadius(
+      cardRect,
+      const Radius.circular(16),
+    );
+    canvas.drawRRect(card.shift(const Offset(0, 6)), _cardBorder);
+    canvas.drawRRect(card, _cardBacking);
   }
 }
