@@ -76,6 +76,12 @@ const List<String> targetFiles = <String>[
   'lib/game/replay.dart',
   'lib/game/run_code.dart',
   'lib/game/verified_score.dart',
+  // Added with the risk reward. Pure Dart, no clock, no randomness — the same
+  // condition every file above satisfies, and the same reason it has to be
+  // here rather than left out: a mutation score is a statement about the code
+  // it covers, and a new scoring rule shipped under an unchanged number would
+  // be the old code's badge on the new code.
+  'lib/game/risk_score.dart',
 ];
 
 /// TIER 1 — the fast gate. These are exactly the test files that import the
@@ -111,6 +117,13 @@ const List<String> tier1Tests = <String>[
   'test/replay_test.dart',
   'test/run_code_test.dart',
   'test/verified_score_test.dart',
+  // Added with the risk reward, and it belongs here by the same rule as
+  // everything above it: it imports the model and asserts on its behaviour, and
+  // it costs about half a second. Leaving it out was measurably expensive rather
+  // than merely untidy — nothing else in tier 1 exercises `riskBonus` at all, so
+  // every one of the 44 mutants in `lib/game/risk_score.dart` survived the fast
+  // gate and escalated to the whole suite before being killed.
+  'test/risk_score_test.dart',
 ];
 
 /// TIER 2 — the escalation. An empty argument list means "every test file",
@@ -357,7 +370,7 @@ class KnownEquivalent {
 const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 639,
+    line: 665,
     original: '<',
     replacement: '<=',
     argument:
@@ -372,7 +385,7 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   ),
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 640,
+    line: 666,
     original: '>',
     replacement: '>=',
     argument:
@@ -384,7 +397,7 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   ),
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 799,
+    line: 861,
     original: '<',
     replacement: '<=',
     argument:
@@ -400,7 +413,7 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   ),
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 370,
+    line: 373,
     original: 'playfieldTop',
     replacement: '0.0',
     argument:
@@ -537,7 +550,7 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   // equivalence argument is the last resort, not the first.
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 259,
+    line: 262,
     original: '<=',
     replacement: '<',
     argument:
@@ -553,7 +566,7 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
   ),
   KnownEquivalent(
     file: 'lib/game/game_model.dart',
-    line: 260,
+    line: 263,
     original: '>=',
     replacement: '>',
     argument:

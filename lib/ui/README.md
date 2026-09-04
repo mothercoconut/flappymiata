@@ -15,6 +15,16 @@ behaves — gravity, gap size, score per pipe — that number belongs in
 | --- | --- |
 | `game_screens.dart` | The start, paused and game-over screens, the pause control, the palette they share with `lib/main.dart`, and `overlaysFor` — the pure function that decides which screen is up. |
 | `high_score_store.dart` | Persistence. The best run as a string, the check that re-executes it before believing it, and the two stores that hold it. |
+| `assist.dart` | Assist mode's solver. Works out where the flap window for the next obstacle is, by running the fairness prover's reachability search BACKWARDS over a bounded horizon. Plain Dart, no Flutter — it returns numbers and draws nothing. |
+
+**`assist.dart` is in here because it is a display aid, and that is a rule and
+not a filing decision.** It reads a `GameModel` and returns some numbers; it is
+never called by `tick`, it is never on the path from a tap to a position, and it
+cannot be. A run played with assist on and the same run played with it off are
+the same run — `test/assist_test.dart` asserts exactly that, frame for frame —
+which is what keeps the replay system, the verified score and the fairness proof
+true. If assist could reach the model, "the same taps" would stop describing the
+same run.
 
 **These files do not import `lib/main.dart`.** The screens talk to a
 `GameScreenHost` — a handful of getters and four verbs — which `FlappyMiataGame`

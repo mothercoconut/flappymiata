@@ -8,12 +8,15 @@
 library;
 
 import 'geometry.dart';
+import 'risk_score.dart';
 
 // Re-exported so that one import — `package:flappymiata/game/game_model.dart` —
 // brings the whole model with it. `Obstacle` is part of the model's surface:
 // anything that reads a `GameModel` also has to be able to read the obstacles
-// hanging off it.
+// hanging off it, and [GameModel.riskScore] cannot be read without the curve
+// that produced it.
 export 'geometry.dart';
+export 'risk_score.dart';
 
 /// Where the gap in obstacle number [index] should sit, as a normalised y.
 ///
@@ -552,7 +555,28 @@ class GameModel {
   final List<Obstacle> obstacles;
 
   /// How many obstacles the car has cleared this run.
+  ///
+  /// UNCHANGED BY THE RISK REWARD, and deliberately so. This is the number a
+  /// run code is verified against (`lib/game/verified_score.dart` re-executes a
+  /// run and compares THIS field), the number every stored best run claims
+  /// (`lib/ui/high_score_store.dart`), and the number the fairness prover's
+  /// world counts obstacles with. Redefining it to mean "points" would have
+  /// invalidated every record already on a device and every witness already
+  /// recorded. So the risk reward is a SECOND number, kept beside it.
   final int score;
+
+  /// Points earned this run for how CLOSE the passes were, on top of [score].
+  ///
+  /// See `lib/game/risk_score.dart` for the curve and for why it cannot be
+  /// farmed; see [tick] for the two lines that decide when it is paid. A run's
+  /// worth to a player is `score + riskScore`; a run's worth to the verifier is
+  /// still [score] alone.
+  ///
+  /// It is part of the run, not a decoration on top of it, so it lives on the
+  /// snapshot and is compared by [operator ==] — which is what makes
+  /// `test/replay_test.dart`'s frame-for-frame comparison cover it for free. A
+  /// replayed run reproduces its risk score or the trace comparison fails.
+  final int riskScore;
 
   /// The index the next obstacle to be created will carry.
   ///
@@ -584,6 +608,7 @@ class GameModel {
       velocity = 0.0,
       obstacles = const <Obstacle>[],
       score = 0,
+      riskScore = 0,
       nextObstacleIndex = 0;
 
   /// Private, because the only legal ways to reach a new state are [tick],
@@ -595,6 +620,7 @@ class GameModel {
     required this.velocity,
     required this.obstacles,
     required this.score,
+    required this.riskScore,
     required this.nextObstacleIndex,
     required this.gapCentreFor,
   });
@@ -768,8 +794,34 @@ class GameModel {
     // Scoring runs BEFORE the death checks below, so a point earned on the same
     // frame as a fatal crash still counts. The pipe that killed the car cannot
     // be the pipe that just scored — see the paragraph above.
+    // -- risk: how close the car came, measured over exactly one interval ----
+    //
+    // WHAT "WHILE PASSING" MEANS: the frames on which the car's box and this
+    // obstacle's box overlap HORIZONTALLY — `Obstacle.isLevelWith`, which is the
+    // x half of `Box.overlaps` and therefore the exact set of frames on which
+    // this pipe could kill the car. Not "while it is on screen", which would
+    // include a pipe five car-lengths ahead and reward nothing; not "while it is
+    // in front of the car", which never ends.
+    //
+    // Called rather than written out here, and that is not tidiness: obstacle
+    // positions come out of the physics, so no test can put a pipe edge exactly
+    // on the car's edge, and the two boundary comparisons would have been
+    // untestable inline. See `Obstacle.isLevelWith`.
+    //
+    // MEASURED AT `nextY` AND AGAINST THE MOVED OBSTACLES, i.e. at the same
+    // instant the collision test below asks about. Measuring the old y against
+    // the new pipes would grade a position the car was never in.
+    //
+    // Interval and payout are deliberately DISJOINT. Overlap needs
+    // `carLeft < right`; scoring needs `right < carLeft`; so an obstacle is
+    // measured for a while, then paid, and never both on one frame. That is
+    // what makes "you only get paid for a pipe you got past" true by
+    // construction rather than by a flag somebody has to maintain.
     int nextScore = score;
+    int nextRisk = riskScore;
     final double carLeft = carX - carWidth / 2;
+    final double carRight = carX + carWidth / 2;
+    final Box nextCar = carBoxAt(nextY);
     for (int i = 0; i < next.length; i++) {
       final Obstacle obstacle = next[i];
       // The `!scored` half is the whole guard. Without it this condition stays
@@ -778,6 +830,16 @@ class GameModel {
       if (!obstacle.scored && obstacle.right < carLeft) {
         next[i] = obstacle.markScored();
         nextScore++;
+        // Cashed HERE, on the one frame the point is awarded, so the risk
+        // reward inherits the `scored` flag's one-shot property exactly. An
+        // obstacle that kills the car never reaches this line, so a scrape you
+        // did not survive is worth nothing.
+        nextRisk += riskBonus(
+          clearance: obstacle.minClearance,
+          room: obstacle.roomFor(carHeight),
+        );
+      } else if (obstacle.isLevelWith(carLeft, carRight)) {
+        next[i] = obstacle.withClearance(obstacle.clearanceTo(nextCar));
       }
     }
 
@@ -803,6 +865,7 @@ class GameModel {
         velocity: nextVelocity,
         obstacles: frozen,
         score: nextScore,
+        riskScore: nextRisk,
         nextObstacleIndex: nextIndex,
         gapCentreFor: gapCentreFor,
       );
@@ -825,6 +888,7 @@ class GameModel {
         velocity: nextVelocity,
         obstacles: frozen,
         score: nextScore,
+        riskScore: nextRisk,
         nextObstacleIndex: nextIndex,
         gapCentreFor: gapCentreFor,
       );
@@ -836,6 +900,7 @@ class GameModel {
       velocity: nextVelocity,
       obstacles: frozen,
       score: nextScore,
+      riskScore: nextRisk,
       nextObstacleIndex: nextIndex,
       gapCentreFor: gapCentreFor,
     );
@@ -854,6 +919,7 @@ class GameModel {
           velocity: flapImpulse,
           obstacles: obstacles,
           score: score,
+          riskScore: riskScore,
           nextObstacleIndex: nextObstacleIndex,
           gapCentreFor: gapCentreFor,
         );
@@ -874,6 +940,7 @@ class GameModel {
           velocity: flapImpulse,
           obstacles: obstacles,
           score: score,
+          riskScore: riskScore,
           nextObstacleIndex: nextObstacleIndex,
           gapCentreFor: gapCentreFor,
         );
@@ -921,6 +988,7 @@ class GameModel {
           other.y == y &&
           other.velocity == velocity &&
           other.score == score &&
+          other.riskScore == riskScore &&
           other.nextObstacleIndex == nextObstacleIndex &&
           _sameObstacles(other.obstacles, obstacles);
 
@@ -930,6 +998,7 @@ class GameModel {
     y,
     velocity,
     score,
+    riskScore,
     nextObstacleIndex,
     Object.hashAll(obstacles),
   );
@@ -937,5 +1006,5 @@ class GameModel {
   @override
   String toString() =>
       'GameModel(${state.name}, y: $y, velocity: $velocity, '
-      'score: $score, obstacles: ${obstacles.length})';
+      'score: $score, risk: $riskScore, obstacles: ${obstacles.length})';
 }

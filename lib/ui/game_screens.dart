@@ -147,8 +147,17 @@ abstract class GameScreenHost {
   /// widget tree do work the canvas is already doing better.
   Listenable get revision;
 
-  /// Points scored in the current run.
+  /// Points scored in the current run: obstacles passed, and nothing else. This
+  /// is the number a run code is verified against.
   int get score;
+
+  /// Points earned in the current run for how CLOSE the passes were.
+  ///
+  /// Shown beside [score] rather than folded into it, for the reason
+  /// `GameModel.score` gives: every stored record and every run code in
+  /// existence claims the obstacle count, and quietly redefining what "score"
+  /// means would invalidate all of them at once.
+  int get riskScore;
 
   /// The best score that has ever been recorded on this device, or 0 if there
   /// is none yet.
@@ -158,8 +167,46 @@ abstract class GameScreenHost {
   /// "no best yet" can be told apart on screen.
   bool get hasBestScore;
 
+  /// Whether the run that just ended IMPROVED on the best score known when it
+  /// started.
+  ///
+  /// ==========================================================================
+  /// WHY THIS IS A FLAG ON THE HOST AND NOT A COMPARISON ON THE SCREEN
+  /// ==========================================================================
+  ///
+  /// It was a comparison, `score >= bestScore`, on the argument that a run only
+  /// ever ties or beats the record at the moment it ends, so equality had to
+  /// mean "this run set it". That argument is false, and it shipped a bug: a
+  /// first run scoring NOTHING records a best of 0, and 0 >= 0 congratulated
+  /// the player for it. A run that merely TIES an older record does the same.
+  ///
+  /// The reason no comparison can work is worth stating, because the next
+  /// person to look at this will want to try a different one. By the time this
+  /// screen is built the best has ALREADY been written, so `score` and
+  /// `bestScore` are equal in two completely different situations — the run
+  /// that just set the record, and a run that tied one set last week. The
+  /// information that separates them is the PREVIOUS best, and it no longer
+  /// exists anywhere on this interface. It is not a comparison the screen is
+  /// getting wrong; it is a fact the screen has not been told.
+  ///
+  /// So the game says it. The flag is set in exactly one place — the same
+  /// branch that writes the new best — which is what keeps it in step with the
+  /// number it describes.
+  bool get isNewBest;
+
   /// Whether the world is currently stopped.
   bool get paused;
+
+  /// Whether the flap-window highlight is being drawn.
+  ///
+  /// A DISPLAY SETTING AND NOTHING ELSE. It reaches no rule: the model does not
+  /// know it exists, the recorder does not write it down, and a run played with
+  /// it on and the same run played with it off are the same run. See
+  /// `lib/ui/assist.dart` for why that has to be true and how it is asserted.
+  bool get assistEnabled;
+
+  /// Turns the flap-window highlight on or off. Off is the default.
+  void toggleAssist();
 
   /// Leaves the start line: the first tap of a run.
   void startRun();
@@ -449,7 +496,34 @@ class StartScreen extends StatelessWidget {
         ),
         const SizedBox(height: 20),
         GameButton(label: 'TAP TO DRIVE', onPressed: host.startRun, primary: true),
+        const SizedBox(height: 12),
+        AssistToggle(host: host),
       ],
+    );
+  }
+}
+
+/// The assist switch, offered on the two screens where the world is stopped.
+///
+/// NOT offered during play. The label has to be read to be useful and reading
+/// it costs the run; and a control on the playfield is a control a flap can hit
+/// by accident. Both screens that show it are screens the player is already
+/// stopped on.
+///
+/// The label states the CURRENT state rather than the action, so a glance
+/// answers "is it on?" — which is the question somebody who has just been shown
+/// an unexpected line across the screen is asking.
+class AssistToggle extends StatelessWidget {
+  /// The game.
+  final GameScreenHost host;
+
+  const AssistToggle({super.key, required this.host});
+
+  @override
+  Widget build(BuildContext context) {
+    return GameButton(
+      label: host.assistEnabled ? 'ASSIST: ON' : 'ASSIST: OFF',
+      onPressed: host.toggleAssist,
     );
   }
 }
@@ -472,10 +546,14 @@ class PausedScreen extends StatelessWidget {
         const ScreenTitle('PAUSED'),
         const SizedBox(height: 16),
         ScoreReadout(label: 'SCORE', value: '${host.score}'),
+        const SizedBox(height: 12),
+        ScoreReadout(label: 'RISK', value: '${host.riskScore}'),
         const SizedBox(height: 20),
         GameButton(label: 'RESUME', onPressed: host.resumeRun, primary: true),
         const SizedBox(height: 12),
         GameButton(label: 'RESTART', onPressed: host.restartRun),
+        const SizedBox(height: 12),
+        AssistToggle(host: host),
       ],
     );
   }
@@ -490,12 +568,9 @@ class GameOverScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // A run only ever ties or beats the stored best at the moment it ends, and
-    // the game has already written it down by the time this is built — so
-    // "equal to the best" IS "this run set it". Written as a comparison rather
-    // than as a flag on the host, because a flag would be a second thing to keep
-    // in step with the score it describes.
-    final bool isBest = host.hasBestScore && host.score >= host.bestScore;
+    // Asked, not deduced. See [GameScreenHost.isNewBest] for why the deduction
+    // this used to make cannot be made from anything on screen.
+    final bool isBest = host.isNewBest;
 
     return GameScreenScaffold(
       onTapAnywhere: host.restartRun,
@@ -503,6 +578,12 @@ class GameOverScreen extends StatelessWidget {
         const ScreenTitle('RUN OVER'),
         const SizedBox(height: 16),
         ScoreReadout(label: 'SCORE', value: '${host.score}'),
+        const SizedBox(height: 12),
+        // Beside the score, never added to it. The two numbers answer different
+        // questions — how far, and how close — and a single total would hide
+        // both. It is also the number no record is verified against, so keeping
+        // them apart on screen keeps them apart in the player's head.
+        ScoreReadout(label: 'RISK', value: '${host.riskScore}'),
         const SizedBox(height: 12),
         if (host.hasBestScore)
           ScoreReadout(label: 'BEST', value: '${host.bestScore}'),

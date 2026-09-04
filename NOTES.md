@@ -875,3 +875,117 @@ scores zero against the ramped game. That is the driver being a bad player, not
 a defect, but it does mean automated "does it still work" checks get weaker as
 the game gets harder. The fairness solver is a competent player and would make a
 far better test driver than a metronome.
+
+## 2026-09-04 — Phase 5b: risk scoring, assist mode, and a deeper bug than the one reported
+
+**Files.** New `lib/game/risk_score.dart`, `lib/ui/assist.dart`,
+`tool/solver_bot.dart`, `test/risk_score_test.dart`, `test/assist_test.dart`.
+Tests 230 -> 282. No dependency added.
+
+### The NEW BEST bug was not the bug I reported
+
+I diagnosed it as `0 >= 0`. That was wrong, or rather it was the symptom. By the
+time the game-over card is built **the record has already been written**, so
+`score == bestScore` covers two situations that need opposite answers: the run
+that just set the record, and a run tying one set last week. The fact that
+distinguishes them no longer exists at that layer. Fixing the operator would
+have shipped the tie case.
+
+The comparison now happens where the previous best is still alive and
+`isNewBest` is passed through. Reverting the screen fix turns 4 of 31 tests red;
+reverting the model-side comparison turns 1 red — the asymmetry is real, only one
+path reaches that line.
+
+**The persistence path was already correct** — both sides used strict `>`. But
+checking it surfaced a different hole: if the asynchronous store answered *after*
+a run finished, a run that beat "no record" kept its claim when a better stored
+record arrived. Now withdrawn. The first version of that guard was too
+aggressive and withdrew every legitimate claim; the negative-control test caught
+it.
+
+### Risk-weighted scoring
+
+`score` is unchanged — obstacles passed — so run codes and stored records are
+unaffected. `riskScore` is a second field, part of `==`, so replay covers it for
+free.
+
+Clearance is measured over exactly the frames the car's box and the obstacle's
+box overlap horizontally — the frames that pipe could kill you — at the post-tick
+`y` the collision test uses.
+
+Curve: `bonus = floor(5 * r^3)` where `r = 1 - clearance/room`.
+
+```
+bonus       1      2      3      4      5
+r >=      0.585  0.737  0.843  0.928  1.000
+```
+
+**Picked, not derived:** the cap of 5 and the exponent 3. Those say how much the
+game wants to pay for risk, and nothing computes them.
+**Derived:** the ratio, from the model's own geometry — using it rather than raw
+distance is what stops the ramp inflating rewards as gaps narrow.
+**Measured, and the reason the exponent is 3:** an obstacle straddles the car for
+43 frames, and `minimumExcursion(43)` is 0.0869, so the flattest pass physics
+permits is r = 0.349 — below the 0.585 the first point costs. **Flying as well as
+the physics allows earns nothing.** You have to actually take risk to be paid.
+
+Anti-farm is an invariant, not a list of tricks: risk only moves on a frame that
+also scores, never decreases, and is bounded by `5 * delta-score`. A pipe that
+kills you never scores, so an unsurvived scrape pays zero.
+
+### Assist mode
+
+Same physics, same lattice, same pessimistic epsilon as the prover. Cheap by
+three changes: bounded horizon (next obstacle + 45 frames), the search runs
+BACKWARDS so one pass answers every candidate tap, and a pass is reused for ~60
+frames because the surviving-state sets belong to the world, not the car.
+
+```
+302 passes: p50 0.47ms  p90 0.84ms  p99 1.13ms  max 1.67ms
+one pass per ~58 frames  ->  0.014 ms/frame amortised
+```
+
+**Where it is wrong, stated rather than buried.** Within its horizon it is
+exact, so it never highlights a tap the physics cannot support. It is
+**optimistic past the horizon**: a highlighted tap clears the next obstacle and
+45 frames beyond, and can still strand you two obstacles later. It says a
+continuation exists, not that any continuation works.
+
+It cannot touch the model. Asserted by playing identical inputs with the solver
+consulted every frame and never constructed, comparing traces frame-for-frame,
+with a non-vacuity assertion that the solver actually answered on 200+ frames.
+
+### A competent test driver
+
+```
+policy    outcome     score   risk  passed  frames  flaps
+solver    survived       45    170      45    3600    273
+```
+
+60 seconds, 45 obstacles, still alive. Over 300s it reaches 237, well past the
+plateau. On the same course `chaseGap` dies at 12 and `holdAltitude` scores 0 —
+and my scripted metronome scored 0 too. Automated checks now have a driver that
+gets better as the game gets harder rather than worse.
+
+### Two mutation boundaries restructured rather than argued away
+
+A saturating clamp is continuous at its own boundary, so `>` and `>=` agree
+there by construction — genuinely unkillable. Rather than write an equivalence
+argument, `riskBonus` now counts thresholds so the saturation lives in a loop
+bound where moving it by one changes the answer. Likewise the "level with the
+car" test moved out of `tick` into `Obstacle.isLevelWith`: inline, pipe
+positions come from the physics and no test could land an edge exactly on the
+car's; as a function of two doubles the boundary is one line of a test.
+
+Converting "no test can catch this" into "a test does catch this" beats a
+well-written excuse. 117 new mutants, 117 killed, 0 equivalence arguments added.
+
+**A hazard worth recording.** `tool/mutate.dart` restores `lib/game/` from a
+startup snapshot when it exits. Editing those files while a run is in flight gets
+them silently reverted. Nothing was lost this time because it was noticed, but a
+background process that quietly undoes your edits is the kind of thing that gets
+blamed on the editor. It should refuse to restore a file whose content changed
+underneath it.
+
+**Unverified on hardware.** Assist mode's appearance — legibility over the pipes,
+whether the window is noticed in time, whether it helps or distracts.
