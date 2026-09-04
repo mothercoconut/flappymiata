@@ -395,3 +395,72 @@ measured to pipes only, not to the playfield edges, so a path that survives by
 hugging the ceiling would not show up in that number. Exactness is in real
 arithmetic; the 1e-9 epsilon is a well-founded argument that float drift cannot
 flip a verdict, not a proof about IEEE doubles.
+
+## 2026-09-03 — Phase 3a: mutation testing to 100%
+
+**Bar 2 closed.** Every single-point mutant of `lib/game/` is killed by a test.
+
+**Files.** `tool/mutate.dart`, `test/tuning_constants_test.dart`,
+`test/model_boundaries_test.dart`. Tests 57 -> 82. `lib/game/` unchanged — the
+score was not reached by editing the code under test.
+
+**Result.**
+
+```
+mutants generated & run     410
+invalid (did not compile)    23   neither a kill nor a survivor
+equivalent (argued)           4   excluded from the denominator
+killed                      383   of which by timeout: 0
+survived                      0
+mutation score  383 / 383 = 100.0%     (83.7% before the new tests)
+```
+
+**Why the invalid ones are excluded from both sides.** A mutant that never
+compiled ran no test, so counting it as a kill is a free win nothing earned — a
+suite asserting nothing at all would collect every one of them. Sixteen of the
+23 are `&&` -> `||` inside `other is X && other.field == field`, where losing
+the type promotion stops it typechecking.
+
+**What the 63 survivors actually revealed.** Not sloppiness — a systematic gap.
+Twenty-four were in the gap-pattern hash: every multiplier, mask and shift could
+change and the suite stayed green, because the tests asserted only *properties*
+(in range, distinct, pure) that a huge family of different hashes satisfies.
+Killed with golden values and an independent re-implementation of the documented
+finaliser. Another twenty-four were tuning constants surviving a 10%
+perturbation, because every assertion was written in terms of the constant
+itself — `closeTo(GameModel.gravity * frame, ...)` passes for any gravity.
+Killed with absolute, game-facing assertions: half a second of falling adds
+exactly 1.1; pipes stand exactly 0.60 apart.
+
+That is the lesson worth keeping. A test written in terms of the constant it is
+testing cannot detect a change to that constant.
+
+**Five boundary survivors** differed from the original on exactly one input —
+the one where two doubles are equal. Killed by solving the physics for that
+exact double and walking neighbouring representable values until the model
+landed on the line.
+
+**Four equivalent mutants, argued individually.** Two `clampGapCentre` boundary
+cases where the original returns `centre`, which IS the clamp bound by the
+equality that selected the branch; one ternary whose equality case is
+unreachable under its guard; and `minY = playfieldTop` -> `0.0`, where
+`playfieldTop` is itself `const 0.0`, so after const evaluation the two programs
+are literally identical. An unargued exclusion is a hidden survivor.
+
+**Proof the tool is not lying.** `--selftest` runs three controls: a
+behaviour-changing edit judged by tests that cover it comes back KILLED; the
+SAME edit judged only by `widget_test.dart`, which never ticks the model, comes
+back SURVIVED; and a syntax error comes back INVALID. The negative control is
+the load-bearing one — it rules out a tool that reports KILLED unconditionally.
+Additionally the 8-worker sandboxed run and the single-worker in-place run agree
+verdict-for-verdict on all 406 mutants.
+
+**A bug found in the harness itself.** A Dart `Future<int> main()` silently
+discards its return value, so the exit code was always 0 — a CI gate that could
+not fail. Found and fixed before CI was built on top of it. Also: an external
+process reading the mutated file caused a Windows file-lock failure in the
+restore path at mutant 73, briefly leaving `lib/game/` mutated. Restore now
+retries; a failed restore is the worst thing this tool can do.
+
+**Runtimes.** Full 410 mutants: 1265s single-worker, 345s with `--jobs=8`.
+`--quick` (54 stratified mutants for CI): 165s, ~30s parallel. Self-test: 13s.
