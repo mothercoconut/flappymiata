@@ -532,3 +532,86 @@ whether a 2-core runner tolerates `android/gradle.properties` asking Gradle for
 `-Xmx8G` against ~7 GB of RAM. The workflow carries a comment on how to lower it
 from `~/.gradle/gradle.properties` without editing the file the other developer
 shares.
+
+## 2026-09-04 — Phase 4: deterministic replay, run codes, verified scores, daily challenge, ghost
+
+**Bar 4 closed.** A run is fully described by a seed plus an input timeline and
+replays frame-exactly.
+
+**New in `lib/game/`** — still pure Dart, no Flame, no Flutter, no clock, no
+randomness: `course_seed.dart` (seeded gap patterns; seed 0 is bit-for-bit the
+shipped hash, plus `dailySeed`), `replay.dart`, `run_code.dart`,
+`verified_score.dart`. Tests 82 -> 167.
+
+**Replay proof.** 33 recorded runs — 8 seeds x 5 policies — 15,497 frames
+compared per pass, shortest 36 frames, longest 3000, 10 distinct scores, both
+death modes, all three run states. Equality is asserted per frame on the whole
+model, not on the endpoint, and `ReplayPlayer` is cross-checked frame-for-frame
+against the independent `tool/headless_sim.dart`.
+
+**Run codes.** Crockford base32 over LEB128 delta varints with a CRC-32.
+A 30-second run on the shipped course is **151 characters**; a long run is 372.
+Length tracks taps, not survival — one byte per tap plus an 8-byte frame.
+
+All **4,681** single-character substitutions of one code were tried: 4,653
+rejected on checksum, 28 on padding, and **0 decoded to a different run**. The
+CRC is pinned to the standard's own check value (`123456789` -> `0xCBF43926`).
+
+**Verified scores — a cheat-proof leaderboard with no server.** Determinism
+means a claimed score is re-executable. Rejects a tampered timeline (all 85
+single-tap deletions checked), an inflated claim on an honest run, and someone
+else's valid code submitted under your claim. Corruption reports
+`unreadableCode` rather than `scoreMismatch` — the distinction the checksum buys.
+
+**Daily challenge.** The date is passed IN; `lib/game/` never reads a clock.
+Same date gives an identical course, different dates differ, and every daily
+course is proven fair by the *existing* prover: **731 dates** across 2024-2025,
+all survivable, tightest margin 0.06851 on 2024-08-13.
+
+**Mutation surface grew 410 -> 1225.** 19 survivors appeared in the new code:
+7 killed by tests, 6 removed by restructuring so the comparison could
+discriminate at all, 6 argued equivalent with both a written proof and an
+empirical check. Back to 0.
+
+### Three bugs found in the tooling itself, all the same shape
+
+**1. `tool/mutate.dart` exited 255 on a clean run.** Sandbox teardown ran before
+the report and threw on a transient Windows file lock, so a green codebase
+produced a red gate with no diagnosis at all. Cleanup is housekeeping; the
+verdicts are the product. Teardown now retries, warns, and can never suppress
+the report or the exit code.
+
+**2. Fixing that exposed a hang it had been masking.** `flutter test` leaves a
+`flutter_tester` grandchild holding the pipe, so with the throw gone the VM
+printed its whole report and then sat there forever. The crash had been acting
+as the exit path. `main` now flushes and calls `exit`.
+
+**3. `--selftest` was already failing before any of this.** Its NEGATIVE control
+depends on a test file that CANNOT see a model change; `widget_test.dart` had
+grown tests that tap and run 120 frames, so it could. The control returned
+KILLED where SURVIVED was required — meaning the next CI run would have gone red
+on gate 5. The judge moved to `car_geometry_test.dart`, which compiles the
+mutated file but asserts only on box shape, and was proven non-vacuous.
+
+That third one is the lesson. The self-test's blind judge is only blind by
+accident of what that file happens to assert, and nothing stops a future test
+from giving it sight. The drift will recur.
+
+**`--quick` retuned.** `ceil(size/8)` per operator family scaled with the
+codebase, so the CI subset went 52 -> 154 mutants and 670s. Replaced with a
+fixed budget of 52 apportioned by highest-averages with a floor of 2 per family.
+Measured 163-238s locally at `--jobs=4`. Traded away sampling density: a hole
+had roughly a 1-in-8 chance of being sampled, now about 1-in-24, and it thins
+further as `lib/game/` grows. The header prints `52 of 1225` so the next person
+to grow the directory sees the ratio. The full run is unchanged and still grades
+the suite.
+
+**CI labels de-staled.** "Gate 2 - all 82 tests pass" became "the whole test
+suite passes" — a property, which cannot go stale, rather than a number that
+already had.
+
+**Unverified.** The ghost car's appearance on hardware: colour, legibility over
+the pipes, whether it reads as a ghost at all. Only the wiring is tested — it
+exists, advances in lockstep, and its positions are ones the recorded run really
+visited. Best-run persistence is in memory only; on-disk needs a storage package
+and none was added.

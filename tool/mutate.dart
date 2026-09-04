@@ -48,9 +48,26 @@ import 'dart:typed_data';
 /// test suite claims to establish. Mutating the renderer would mostly generate
 /// mutants no headless test could ever kill, which inflates the survivor list
 /// with noise and teaches the reader to ignore it.
+/// APPEND, NEVER INSERT. Mutant ids are assigned per operator family in this
+/// order, so putting a new file in the middle would renumber every mutant after
+/// it and silently invalidate every `--only=` reproduction anybody has written
+/// down, plus the line numbers in [knownEquivalents].
 const List<String> targetFiles = <String>[
   'lib/game/game_model.dart',
   'lib/game/geometry.dart',
+  // Added with the replay work. Every one of these is pure Dart with no clock
+  // and no randomness, which is the condition for a mutant's effect to be a
+  // deterministic function of the source — and therefore for "the suite did not
+  // notice" to be a fact rather than a flake.
+  //
+  // WHY THEY HAD TO BE ADDED RATHER THAN LEFT OUT: a mutation score is a
+  // statement about the code it covers. Shipping four new files of rules under
+  // an unchanged 100% would have been a statement about the OLD code wearing
+  // the new code's badge.
+  'lib/game/course_seed.dart',
+  'lib/game/replay.dart',
+  'lib/game/run_code.dart',
+  'lib/game/verified_score.dart',
 ];
 
 /// TIER 1 — the fast gate. These are exactly the test files that import the
@@ -71,12 +88,21 @@ const List<String> targetFiles = <String>[
 /// Measured on this machine: tier 1 is 2.9s, the full suite is 9.5s. Nearly all
 /// of that 6.6s difference is `fairness_prover_test.dart`, which searches a
 /// reachability bitmap and is by far the most expensive file in the suite.
+/// `test/daily_challenge_test.dart` is deliberately NOT here even though it
+/// asserts hard on `lib/game/course_seed.dart`: it runs the reachability prover
+/// over 366 courses and costs about three seconds, which is the same reason
+/// `fairness_prover_test.dart` is not here either. Both are in tier 2, so no
+/// mutant is ever called a survivor without them — only the ~95% that die
+/// immediately skip them.
 const List<String> tier1Tests = <String>[
   'test/game_model_test.dart',
   'test/car_geometry_test.dart',
   'test/headless_sim_test.dart',
   'test/tuning_constants_test.dart',
   'test/model_boundaries_test.dart',
+  'test/replay_test.dart',
+  'test/run_code_test.dart',
+  'test/verified_score_test.dart',
 ];
 
 /// TIER 2 — the escalation. An empty argument list means "every test file",
@@ -84,6 +110,15 @@ const List<String> tier1Tests = <String>[
 /// `fairness_prover_test.dart` (whose prover re-derives the model's physics and
 /// so can see constant changes tier 1 might not) and `widget_test.dart`.
 const List<String> tier2Tests = <String>[];
+
+/// The judge for the `--selftest` NEGATIVE control: a test file that compiles
+/// `lib/game/game_model.dart` but cannot observe a change to its physics.
+///
+/// Named here, as configuration, rather than buried in the self-test, because
+/// it is the one input to this tool that is a claim about a file somebody else
+/// owns — and it has already gone stale once. See [_runSelfTest] for the full
+/// argument and for what to do if it goes stale again.
+const String negativeControlTest = 'test/car_geometry_test.dart';
 
 /// Files and directories copied into a worker sandbox by `--jobs=N`.
 ///
@@ -226,6 +261,118 @@ const List<KnownEquivalent> knownEquivalents = <KnownEquivalent>[
         'evaluation the two programs are byte-for-byte the same program. Not '
         '"behaves the same" — literally the same value, including its sign '
         'bit, so no input and no observation of any kind can distinguish them.',
+  ),
+
+  // ---------------------------------------------------------------------------
+  // Added with the replay work. Two shapes, both of them properties of the
+  // arithmetic rather than of the tests:
+  //
+  //   * negating a floating-point zero, which IEEE-754 makes indistinguishable
+  //     from positive zero under every operation this code performs;
+  //   * seeding a bit-shift accumulator with a value that lives permanently
+  //     above the window any read ever looks at.
+  //
+  // Each was also checked empirically before being written down — the mutated
+  // variant was implemented beside the original and the two compared over
+  // thousands of inputs — because "I cannot think of an input that separates
+  // them" and "no input separates them" are different claims.
+  // ---------------------------------------------------------------------------
+  KnownEquivalent(
+    file: 'lib/game/course_seed.dart',
+    line: 151,
+    original: '400',
+    replacement: '(-(400))',
+    argument:
+        'daysFromCivil: `shiftedYear % 400` becomes `shiftedYear % -400`. Dart '
+        'defines `%` as EUCLIDEAN modulo — the specification for `int.%` says '
+        'the result r satisfies 0 <= r < b.abs() — so the sign of the divisor '
+        'cannot reach the result at all, and x % 400 and x % -400 are the same '
+        'number for every x. (This is where Dart differs from C and Java, '
+        'whose `%` takes the sign of the dividend; in those languages the '
+        'mutant would be a real bug.) Checked as well as argued: the whole '
+        'function was evaluated both ways over 216,036 dates spanning the '
+        'years -2000 to 4000 and every result was identical. The divisor of '
+        'the `~/` on the same line is a separate mutant and IS killed.',
+  ),
+  KnownEquivalent(
+    file: 'lib/game/replay.dart',
+    line: 360,
+    original: '0.0',
+    replacement: '(-(0.0))',
+    argument:
+        'FixedStepAccumulator: `double _carry = 0.0;` becomes `-0.0`. IEEE-754 '
+        'defines -0.0 == +0.0 as TRUE, and every operation this field is ever '
+        'subjected to — `+=`, `-=`, `>=`, and the `==` inside the tests — '
+        'treats the two identically: -0.0 + x is x for every finite x, and '
+        '-0.0 >= y has the same truth value as 0.0 >= y for every y. The three '
+        'operations that CAN distinguish them are `isNegative`, division (the '
+        'sign of the resulting infinity) and `toString`, and none of the three '
+        'appears anywhere in this file or in any test of it. Checked as well as '
+        'argued: 20,000 randomised jittery frame sequences produce identical '
+        'step counts from either starting value.',
+  ),
+  KnownEquivalent(
+    file: 'lib/game/replay.dart',
+    line: 389,
+    original: '0.0',
+    replacement: '(-(0.0))',
+    argument:
+        'FixedStepAccumulator.stepsFor: `_carry = 0.0;` — the over-budget '
+        'reset — becomes `-0.0`. Identical argument to the initialiser above, '
+        'and covered by the same 20,000-sequence check: the value written here '
+        'is only ever read back through `+=`, `>=` and `==`, all of which treat '
+        'the two zeros as the same number.',
+  ),
+  KnownEquivalent(
+    file: 'lib/game/replay.dart',
+    line: 374,
+    original: '>',
+    replacement: '>=',
+    argument:
+        'FixedStepAccumulator.stepsFor: `if (!(realSeconds > 0)) return 0;` '
+        'becomes `>= 0`. The two differ on exactly one input, realSeconds == '
+        '0.0. The guard version returns 0 immediately; the mutant falls '
+        'through, executes `_carry += 0.0` — which leaves the carry bit-for-bit '
+        'unchanged for every value it can hold, including NaN, which cannot be '
+        'reached here because a NaN fails both comparisons — then finds the '
+        'loop condition unchanged and returns the same 0. Adding zero is the '
+        'identity, so no sequence of calls can separate them. This one cannot '
+        'be restructured away: any guard that differs only at zero is '
+        'unobservable precisely because zero is the additive identity.',
+  ),
+  KnownEquivalent(
+    file: 'lib/game/run_code.dart',
+    line: 424,
+    original: '0',
+    replacement: '(0 + 1)',
+    argument:
+        '_base32Encode: `int buffer = 0;` becomes 1. The stray bit starts at '
+        'position 0 and is pushed up by 8 on every byte, so after k bytes it '
+        'sits at position 8k. Every read is `(buffer >> bits) & 0x1F` with '
+        'bits < 5, i.e. a window over positions [bits, bits + 4] which never '
+        'reaches position 8; the padding write is `(buffer << (5 - bits)) & '
+        '0x1F`, a window over the low five bits for the same reason. The seeded '
+        'bit is therefore above every window that is ever read, for every input '
+        'and every payload length. Checked: 6,020 payloads of 0 to 300 bytes '
+        'encode to byte-identical strings from either starting value.',
+  ),
+  KnownEquivalent(
+    file: 'lib/game/run_code.dart',
+    line: 511,
+    original: '0',
+    replacement: '(0 + 1)',
+    argument:
+        '_base32Decode: `int buffer = 0;` becomes 1. Same shape, and the bound '
+        'is provable rather than merely plausible. After k characters the '
+        'stray bit is at position 5k and the code has emitted m bytes, so '
+        'bits = 5k - 8m; the emit window is [bits, bits + 7], whose top is '
+        '5k - 8m + 7. The stray bit clears that window exactly when 8m > 7, '
+        'i.e. whenever any byte has been emitted at all — and before the first '
+        'emission no read happens. The final padding test masks positions '
+        '[0, bits - 1] and bits <= 5k, so the stray bit is outside that too. '
+        'Checked: 6,020 code lengths from 0 to 300 characters decode to '
+        'identical bytes AND to the identical padding verdict from either '
+        'starting value.',
   ),
 ];
 
@@ -1237,10 +1384,32 @@ String sha256Hex(List<int> data) {
 /// a CI job wired to `--quick` would go green over a survivor. Only assigning
 /// `exitCode` (or calling `exit`) sets the status. An earlier version of this
 /// comment said the synchronous form was safe; it is not.
-Future<int> main(List<String> args) async {
+Future<void> main(List<String> args) async {
   final int status = await _run(args);
+
+  // `exitCode` is set as well as `exit()` being called, because they answer two
+  // different questions: a `Future<int> main` has its return value DISCARDED by
+  // the VM, so the assignment is what makes the number reachable at all, and
+  // the call below is what makes the process actually reach it.
   exitCode = status;
-  return status;
+
+  // WHY THIS LEAVES EXPLICITLY INSTEAD OF RETURNING AND LETTING THE VM DRAIN.
+  //
+  // `flutter test` is not one process. It spawns a `flutter_tester` grandchild
+  // that inherits the pipes this tool reads, and when a mutant hangs the suite
+  // and the timeout fires, killing the child does not always take the
+  // grandchild with it. What is left is a pipe nobody will ever close, and a
+  // Dart VM will not exit while something is still listening to one. Observed
+  // directly: a `--quick --jobs=4` run printed its entire report at 201s and
+  // was still resident ten minutes later, having produced no exit code at all.
+  //
+  // That is the worst possible shape for a CI gate. A wrong answer is at least
+  // an answer; a job that hangs until the runner's timeout kills it reports
+  // nothing, and the report it already printed scrolls past unread. By this
+  // point every verdict is computed, printed and flushed, so there is nothing
+  // left for the event loop to do that anyone is waiting for.
+  await stdout.flush();
+  exit(status);
 }
 
 Future<int> _run(List<String> args) async {
@@ -1445,11 +1614,11 @@ Future<int> _run(List<String> args) async {
       }
     }
 
-    for (final String root in roots) {
-      if (root != repoRoot) {
-        Directory(root).deleteSync(recursive: true);
-      }
-    }
+    // Housekeeping, deliberately incapable of failing the run — see
+    // [_removeSandboxes]. Every verdict above is already computed by this
+    // point, so an exception escaping from a directory delete would throw away
+    // the entire diagnosis over some bytes in the system temp folder.
+    final List<String> teardownWarnings = _removeSandboxes(roots, repoRoot);
 
     results.sort((MutantResult a, MutantResult b) =>
         a.mutant.id.compareTo(b.mutant.id));
@@ -1463,8 +1632,23 @@ Future<int> _run(List<String> args) async {
       restored: restored,
       wall: wall.elapsed,
       quick: quick,
+      teardownWarnings: teardownWarnings,
     );
 
+    // THE EXIT CODE REFLECTS THE VERDICTS AND NOTHING ELSE.
+    //
+    // GitHub decides a step failed by reading this number, so every value it
+    // can take has to mean something a reader would act on:
+    //
+    //   2 — the tool could not do its job, so no score it printed is evidence
+    //       (a target file missing, a stale equivalence table, a tree it could
+    //       not restore).
+    //   1 — the tool worked and found at least one survivor: a real hole.
+    //   0 — the tool worked and every mutant it selected was accounted for.
+    //
+    // `teardownWarnings` is deliberately absent from this decision. A sandbox
+    // that could not be deleted says nothing about the code under test, and a
+    // gate that goes red over it would train everyone to ignore red.
     if (!restored) {
       return 2;
     }
@@ -1505,11 +1689,27 @@ Future<MutantResult> _judge(
 
 /// Creates worker sandbox [i]: a minimal copy of the package that `flutter
 /// test` can run in, with its own `lib/game/` for this worker to break.
+///
+/// WHY THE STALE DIRECTORY IS CLEARED RATHER THAN REUSED: the sandbox has to
+/// hold exactly the files this run copied into it. Reusing a directory left by
+/// an older tree could leave a test file behind that no longer exists here, and
+/// every verdict after that would be judged by a suite nobody has.
+///
+/// WHY FAILING TO CLEAR IT IS NOT FATAL. The clear can fail for the same
+/// Windows reason [_removeSandboxes] exists: a `flutter test` process from the
+/// previous run — sometimes one that never exited at all — still holds a handle
+/// inside it, and `deleteSync` throws. That used to kill the run at startup with
+/// exit 255 and no report, which is the same defect as the one at teardown,
+/// just moved earlier. So the delete is retried, and if it still will not go, a
+/// fresh uniquely-named directory is used instead of the preferred one. A
+/// second-choice path costs nothing; a dead run costs the whole diagnosis.
 String _makeSandbox(String repoRoot, int i) {
-  final Directory dir =
-      Directory('${Directory.systemTemp.path}/flappymiata_mutate_$i');
-  if (dir.existsSync()) {
-    dir.deleteSync(recursive: true);
+  final String preferred = '${Directory.systemTemp.path}/flappymiata_mutate_$i';
+  Directory dir = Directory(preferred);
+  if (dir.existsSync() && _deleteDirWithRetry(dir) != null) {
+    dir = Directory.systemTemp.createTempSync('flappymiata_mutate_${i}_');
+    stdout.writeln('note: could not clear $preferred (something still holds a '
+        'handle in it); worker $i will use ${dir.path} instead');
   }
   dir.createSync(recursive: true);
 
@@ -1539,6 +1739,79 @@ String _makeSandbox(String repoRoot, int i) {
     }
   }
   return dir.path;
+}
+
+/// Deletes the worker sandboxes created by [_makeSandbox]. Returns one warning
+/// line per directory that could not be removed. **Never throws.**
+///
+/// WHY A FAILED DELETE MUST NOT FAIL THE RUN. This runs after every verdict has
+/// been computed and before any of them has been shown. On Windows a
+/// `flutter test` process that has only just exited can still hold a handle
+/// somewhere inside its sandbox for a few milliseconds — an antivirus scanner
+/// or the search indexer following the process out does the same — and
+/// `deleteSync` then throws `FileSystemException`. Letting that escape killed
+/// the whole run with exit 255 and printed no report at all, so a perfectly
+/// green codebase produced a red gate and no diagnosis. The verdicts are the
+/// product; cleanup is housekeeping, and housekeeping does not get a vote on
+/// whether the gate is red.
+///
+/// WHY LEAVING A STALE DIRECTORY BEHIND IS SAFE, and not a leak that grows.
+/// The sandbox path is derived from the worker index, not from a timestamp or
+/// a random suffix, so there are at most `--jobs` of them; and [_makeSandbox]
+/// clears any pre-existing directory of that name before it copies anything.
+/// The next run therefore starts from a clean sandbox whether or not this one
+/// managed to tidy up. The worst case is a few tens of megabytes sitting in
+/// the system temp folder until the next run, or until the OS clears it.
+///
+/// That argument only holds because [_makeSandbox] can SURVIVE finding a stale
+/// directory it cannot delete — it retries, then falls back to a fresh path.
+/// Before that, a lock held past the end of one run made the NEXT run die at
+/// startup with exit 255, which would have made "just leave it behind"
+/// a way of moving the bug rather than fixing it. The two halves are one fix.
+///
+/// WHY IT RETRIES FIRST. The lock is usually transient — it belongs to a
+/// process that has already exited — so pausing briefly turns most of these
+/// into a delay instead of a warning. Same reasoning, and the same shape, as
+/// [_writeWithRetry]; only the consequence of giving up differs.
+List<String> _removeSandboxes(List<String> roots, String repoRoot) {
+  final List<String> warnings = <String>[];
+  for (final String root in roots) {
+    // `--jobs=1` runs in the repository itself. Never delete that.
+    if (root == repoRoot) {
+      continue;
+    }
+    final String? why = _deleteDirWithRetry(Directory(root));
+    if (why != null) {
+      warnings.add('could not delete temporary sandbox $root — $why');
+    }
+  }
+  return warnings;
+}
+
+/// Deletes [dir] and everything under it, retrying briefly. Returns `null` once
+/// it is gone, or a one-line description of the last failure if it is not.
+/// **Never throws** — both callers have already decided that a directory they
+/// could not remove is not worth failing over.
+///
+/// One second of retries, in 50ms steps. Long enough for a process that has
+/// just exited to actually release its handles, short enough that a genuinely
+/// stuck directory does not stall the run.
+String? _deleteDirWithRetry(Directory dir) {
+  Object? last;
+  for (int attempt = 0; attempt < 20; attempt++) {
+    try {
+      if (!dir.existsSync()) {
+        return null;
+      }
+      dir.deleteSync(recursive: true);
+      return null;
+    } on FileSystemException catch (e) {
+      last = e;
+      sleepMillis(50);
+    }
+  }
+  // One last look: another process may have released it on the final sleep.
+  return dir.existsSync() ? '$last' : null;
 }
 
 void _applyMutant(String repoRoot, Mutant m, String original) {
@@ -1593,35 +1866,129 @@ String _verdictLabel(Verdict v) => switch (v) {
 // --quick
 // =============================================================================
 
+/// How many mutants `--quick` may run, in total, no matter how big `lib/game/`
+/// gets.
+///
+/// WHY A FIXED BUDGET AND NOT A FIXED FRACTION. The previous rule took
+/// `ceil(size / 8)` from every operator family, which sounds stable and is not:
+/// it makes the CI subset a fixed FRACTION of a surface that only ever grows.
+/// Four files were added to `lib/game/` and the mutation surface went from 410
+/// mutants to 1225, so the subset went from ~52 to 154 and the CI step got
+/// three times longer — silently, in a commit that was about something else,
+/// with the job's 45-minute ceiling unchanged. Anything derived from the size
+/// of the code will do that again the next time the code grows.
+///
+/// A budget cannot. The number below IS the CI cost: 52 mutants is what this
+/// gate used to run and what it was timed against, so pinning it here restores
+/// that cost and holds it there. When the surface grows the sample gets
+/// thinner, which is the honest trade — see [quickSubset] for what that buys
+/// and what it gives up.
+const int quickBudget = 52;
+
+/// The least any non-empty operator family may contribute, even if its
+/// proportional share rounds to less. Two rather than one so a family is
+/// sampled at both ends of its range rather than at a single point.
+const int quickFamilyFloor = 2;
+
 /// The CI subset, stated precisely because "a subset" that nobody can reproduce
 /// is not a gate.
 ///
-/// THE RULE: within each operator family, sorted by file then source offset,
-/// take every k-th mutant where k is chosen so the family contributes
-/// `ceil(size / 8)` mutants, with a floor of 2 (or the whole family if it has
-/// fewer than 2). Selection is by index arithmetic only — no randomness, no
-/// clock — so the same commit always yields the same subset, and a CI failure
-/// can be reproduced locally with `--only=<id>`.
+/// THE RULE, in three steps, all integer arithmetic:
+///
+///   1. Every non-empty operator family is given `min(2, size)` places up
+///      front. This is the floor, and it is what keeps the subset stratified:
+///      no family can be squeezed out by the big ones.
+///   2. The rest of [quickBudget] is apportioned between the families in
+///      proportion to their size by the HIGHEST-AVERAGES (D'Hondt) method —
+///      each remaining place goes to the family with the largest
+///      `size / (places + 1)`, compared by cross-multiplication so no floating
+///      point is involved. Ties go to the family declared first in [MutOp],
+///      which is what makes the outcome reproducible rather than merely
+///      deterministic-looking.
+///   3. Within a family, sorted by file then source offset, the places are
+///      filled at evenly spaced indices with both endpoints included.
+///
+/// There is no randomness and no clock anywhere in that, so the same commit
+/// always yields the same subset and anything CI flags reproduces locally with
+/// `--only=<id>`.
 ///
 /// WHY STRATIFIED RATHER THAN "THE FIRST N": every operator family stays
 /// represented. A subset that happened to be all constant mutants would go
 /// green while the relational operator was completely broken, and a gate that
-/// cannot fail for a whole class of defect is not a gate.
+/// cannot fail for a whole class of defect is not a gate. Step 1 guarantees
+/// representation; step 2 keeps the weight roughly proportional to where the
+/// mutants actually are.
+///
+/// WHAT THE BUDGET COSTS. Under the old rule each family gave up an eighth of
+/// itself, so a hole anywhere had about a one-in-eight chance of being sampled.
+/// Under a fixed budget that odds ratio falls as `lib/game/` grows — at 1225
+/// mutants it is roughly one in twenty-four. This gate is therefore a WEAKER
+/// smoke test than it was, and deliberately so: the alternative was a gate that
+/// grows without bound until it hits the job timeout and reports nothing at
+/// all. The full run, `dart run tool/mutate.dart` with no `--quick`, is still
+/// the thing that grades the suite, and it is unchanged.
 ///
 /// WHAT IT IS AND IS NOT FOR: it is a smoke test that the tool still applies
 /// mutants and the suite still kills them. Its pass rate is NOT the mutation
 /// score, and the report says so.
 List<Mutant> quickSubset(List<Mutant> all) {
-  final List<Mutant> out = <Mutant>[];
+  // Families in [MutOp] declaration order. That fixed order is what every
+  // tie-break below leans on, so it is established once, here.
+  final List<List<Mutant>> families = <List<Mutant>>[];
   for (final MutOp op in MutOp.values) {
     final List<Mutant> family = all.where((Mutant m) => m.op == op).toList();
-    if (family.isEmpty) {
-      continue;
+    if (family.isNotEmpty) {
+      families.add(family);
     }
-    final int want = family.length <= 2 ? family.length : _max(2, (family.length + 7) ~/ 8);
-    // Evenly spaced indices across the family, endpoints included.
-    for (int i = 0; i < want; i++) {
-      final int idx = want == 1 ? 0 : (i * (family.length - 1)) ~/ (want - 1);
+  }
+  if (families.isEmpty) {
+    return <Mutant>[];
+  }
+
+  final int n = families.length;
+  final List<int> places = List<int>.filled(n, 0);
+
+  // Step 1 — the floor.
+  int spent = 0;
+  for (int i = 0; i < n; i++) {
+    places[i] = _min(quickFamilyFloor, families[i].length);
+    spent += places[i];
+  }
+
+  // Step 2 — apportion what is left, highest averages first.
+  int remaining = quickBudget - spent;
+  while (remaining > 0) {
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+      if (places[i] >= families[i].length) {
+        continue; // this family is already taken whole; it cannot take more
+      }
+      if (best < 0) {
+        best = i;
+        continue;
+      }
+      // families[i].size / (places[i] + 1)  >  families[best].size / (places[best] + 1)
+      // cross-multiplied, so this stays exact integer arithmetic.
+      final int lhs = families[i].length * (places[best] + 1);
+      final int rhs = families[best].length * (places[i] + 1);
+      if (lhs > rhs) {
+        best = i; // strictly greater, so an exact tie keeps the earlier family
+      }
+    }
+    if (best < 0) {
+      break; // every family exhausted: the budget is bigger than the surface
+    }
+    places[best]++;
+    remaining--;
+  }
+
+  // Step 3 — fill each family's places at evenly spaced indices.
+  final List<Mutant> out = <Mutant>[];
+  for (int i = 0; i < n; i++) {
+    final List<Mutant> family = families[i];
+    final int want = places[i];
+    for (int j = 0; j < want; j++) {
+      final int idx = want == 1 ? 0 : (j * (family.length - 1)) ~/ (want - 1);
       final Mutant m = family[idx];
       if (!out.contains(m)) {
         out.add(m);
@@ -1631,7 +1998,7 @@ List<Mutant> quickSubset(List<Mutant> all) {
   return out;
 }
 
-int _max(int a, int b) => a > b ? a : b;
+int _min(int a, int b) => a < b ? a : b;
 
 // =============================================================================
 // --selftest  (Part 3: prove the tool is capable of every verdict)
@@ -1650,10 +2017,34 @@ int _max(int a, int b) => a > b ? a : b;
 ///   INVALID  — a syntactically broken edit must come back INVALID and must NOT
 ///              be counted as a kill.
 ///
-/// The negative control uses `test/widget_test.dart`, which asserts only that
-/// `main.dart` hands Flutter a `GameWidget`. It never ticks the model, so no
-/// change to `lib/game/` can make it fail — which is exactly what makes it a
-/// valid negative control rather than a rigged one.
+/// THE NEGATIVE CONTROL'S JUDGE, and why it is the file named in
+/// [negativeControlTest] rather than some other one.
+///
+/// A negative control needs a judge that is BLIND TO THIS EDIT and BLIND TO
+/// NOTHING ELSE. Both halves matter. If the judge could see the edit, the
+/// control fails on working code. If the judge could see nothing at all — an
+/// empty test file, a suite of `expect(true, isTrue)` — then SURVIVED is what
+/// it would say about everything, and a control that cannot say anything else
+/// proves nothing.
+///
+/// `test/car_geometry_test.dart` satisfies both. It imports the mutated file,
+/// so the edit really is written to disk and really is compiled before the
+/// verdict is reached; but every assertion in it is about the SHAPE of the
+/// car's collision box — widths, aspect ratios, areas — and it never calls
+/// `tick` or `flap`. Gravity cannot reach it. Meanwhile a change to
+/// `carSpriteAspect` or `carWidth` would fail it immediately, so it is
+/// demonstrably capable of going red.
+///
+/// THIS DRIFTED ONCE ALREADY, WHICH IS THE REASON FOR THE PARAGRAPH ABOVE. The
+/// original judge was `test/widget_test.dart`, chosen when that file asserted
+/// only that `main.dart` hands Flutter a `GameWidget`. It later grew tests that
+/// tap, run the game for 120 frames and check the car is dead — at which point
+/// it could see gravity perfectly well, the negative control started reporting
+/// KILLED, and `--selftest` failed on a clean tree. Note what did NOT happen:
+/// the tool did not quietly keep passing. A broken control that fails loudly is
+/// the outcome this whole self-test exists to produce, so if the line below
+/// ever starts reporting KILLED again, the fix is to find a judge that is still
+/// blind to the edit — never to relax the assertion.
 Future<bool> _runSelfTest(
   String flutterCmd,
   String repoRoot,
@@ -1669,6 +2060,14 @@ Future<bool> _runSelfTest(
   final String src = originalText[file]!;
   if (!src.contains(gravityDecl)) {
     stdout.writeln('FATAL: selftest anchor not found: $gravityDecl');
+    return false;
+  }
+  // Checked explicitly, because a missing judge would otherwise show up as
+  // `NEGATIVE => KILLED` — a failure that reads like "the control broke" when
+  // the real cause is "the file is not there".
+  if (!File('$repoRoot/$negativeControlTest').existsSync()) {
+    stdout.writeln('FATAL: negative control judge not found: '
+        '$negativeControlTest');
     return false;
   }
 
@@ -1694,11 +2093,16 @@ Future<bool> _runSelfTest(
   }
 
   final TestRun negative =
-      await withSource(gravityBroken, <String>['test/widget_test.dart']);
+      await withSource(gravityBroken, <String>[negativeControlTest]);
   stdout.writeln(
-    'NEGATIVE  the same edit, judged by widget_test only    '
+    'NEGATIVE  the same edit, judged by the blind test only '
     '=> ${_verdictLabel(negative.verdict)}   (want SURVIVED)',
   );
+  stdout.writeln('          judge: $negativeControlTest — compiles the mutated '
+      'file, cannot observe gravity');
+  if (negative.verdict != Verdict.survived && negative.detail.isNotEmpty) {
+    stdout.writeln('          ${negative.detail}');
+  }
 
   final TestRun invalid = await withSource(syntaxBroken, tier1Tests);
   stdout.writeln(
@@ -1748,7 +2152,16 @@ void _printHeader(List<Mutant> all, bool quick, Duration timeout, int jobs) {
           'written to in this mode)'
       : 'jobs: 1 (mutating lib/game in place, restored after every mutant)');
   if (quick) {
-    stdout.writeln('mode: --quick (stratified CI subset; NOT the mutation score)');
+    // State the size of the subset AND the size of the surface it was drawn
+    // from, together, on one line. The ratio is the honest description of how
+    // much this gate can see, and it is the number that quietly changed the
+    // last time `lib/game/` grew.
+    final int picked = quickSubset(all).length;
+    stdout.writeln('mode: --quick — $picked of ${all.length} mutants, '
+        'stratified across all ${MutOp.values.length} operator families '
+        '(budget $quickBudget)');
+    stdout.writeln('      a smoke test, NOT the mutation score: run without '
+        '--quick for that');
   }
   stdout.writeln('');
 }
@@ -1762,6 +2175,7 @@ void _printReport({
   required bool restored,
   required Duration wall,
   required bool quick,
+  required List<String> teardownWarnings,
 }) {
   int count(Verdict v) =>
       results.where((MutantResult r) => r.verdict == v).length;
@@ -1876,6 +2290,22 @@ void _printReport({
       ? '  RESTORED — lib/game is byte-identical to how the run found it.'
       : '  NOT RESTORED — lib/game has been left modified. Fix before committing.');
   stdout.writeln('');
+
+  // ---- teardown ---------------------------------------------------------
+  // Printed as a warning and never as a failure. A temporary directory that
+  // outlived the run is untidy; it is not a finding about the code, and it does
+  // not change the exit code (see the contract in `_run`).
+  if (teardownWarnings.isNotEmpty) {
+    stdout.writeln('WARNING — cleanup left something behind (${teardownWarnings.length}):');
+    for (final String w in teardownWarnings) {
+      stdout.writeln('  $w');
+    }
+    stdout.writeln('  Harmless: the next run clears a sandbox of that name '
+        'before reusing it, and takes a fresh path if it still cannot. Does '
+        'not affect the exit code.');
+    stdout.writeln('');
+  }
+
   stdout.writeln('wall clock: ${(wall.inMilliseconds / 1000).toStringAsFixed(1)}s'
       ' for $total mutants');
 }

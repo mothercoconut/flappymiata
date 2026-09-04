@@ -3,6 +3,7 @@
 ///     dart run tool\prove_fairness.dart              # full report
 ///     dart run tool\prove_fairness.dart --quick      # small run, seconds
 ///     dart run tool\prove_fairness.dart --courses=1000 --window=3
+///     dart run tool\prove_fairness.dart --dates=0    # skip the daily sweep
 ///
 /// It does three things, in this order and deliberately in this order:
 ///
@@ -12,12 +13,17 @@
 ///           sweep while being worth nothing, so this runs FIRST and the
 ///           command exits non-zero if any of it comes out wrong.
 ///   PART 4  runs the prover over the shipped game's own course.
+///   PART 5  runs the SAME prover over every daily-challenge course in a
+///           two-year range. Same searches, same epsilon, same course factory —
+///           a second generator held to the first one's standard of evidence
+///           rather than to a new one written for the occasion.
 ///
 /// Exit code 0 means every expectation held.
 library;
 
 import 'dart:io';
 
+import 'package:flappymiata/game/course_seed.dart';
 import 'package:flappymiata/game/game_model.dart';
 
 import 'fairness.dart';
@@ -33,6 +39,10 @@ void main(List<String> args) {
   final int continuous =
       int.parse(opts['continuous'] ?? (quick ? '200' : '10000'));
   final int sample = int.parse(opts['sample'] ?? '200');
+  // 731 days from 2024-01-01 is two whole calendar years, 2024 and 2025, so
+  // every month length and one 29 February are covered. A leap year on purpose:
+  // the day-number arithmetic is the one place a calendar bug could hide.
+  final int dates = int.parse(opts['dates'] ?? (quick ? '60' : '731'));
 
   final FairnessProver prover = FairnessProver();
   final Stopwatch total = Stopwatch()..start();
@@ -62,6 +72,7 @@ void main(List<String> args) {
   _part3(prover);
   _part4Windows(prover, courses, window, sample);
   if (continuous > 0) _part4Continuous(prover, continuous);
+  if (dates > 0) _part5Daily(prover, 2024, 1, 1, dates, window);
 
   total.stop();
   stdout.writeln('');
@@ -499,6 +510,96 @@ void _part4Continuous(FairnessProver prover, int obstacles) {
   }
   stdout.writeln('  squeeze wall time      '
       '${(squeeze.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
+}
+
+// =============================================================================
+// PART 5 — the daily challenge, held to the same bar
+// =============================================================================
+
+/// Proves every date in a range, using the SAME prover, the SAME course
+/// factory and the SAME epsilon as the shipped pattern above.
+///
+/// WHY THE DAILY COURSES NEED THIS MORE THAN THE SHIPPED ONE DOES: the shipped
+/// pattern is one course. It was proved once, and if a bad stretch had turned
+/// up, somebody would have found it and the constants would have moved. A
+/// date-seeded course is a course NOBODY CHOSE and nobody has played. An
+/// unfair one does not get discovered in review — it arrives at midnight, for
+/// everybody at once, and is unplayable for a day.
+///
+/// The sweep is over WINDOWS for the same reason Part 4's is: a lone obstacle
+/// can never be unfair, so the interesting question is always a transition, and
+/// a window of [window] consecutive gaps is the smallest thing that contains
+/// one.
+void _part5Daily(
+  FairnessProver prover,
+  int startYear,
+  int startMonth,
+  int startDay,
+  int days,
+  int window,
+) {
+  _banner('PART 5 — every daily challenge in a $days-day range');
+
+  final DateTime first = DateTime.utc(startYear, startMonth, startDay);
+  final DateTime last = first.add(Duration(days: days - 1));
+  stdout.writeln('  range                  '
+      '${first.toIso8601String().substring(0, 10)} .. '
+      '${last.toIso8601String().substring(0, 10)}  ($days dates)');
+  stdout.writeln('  obstacles per course   $window');
+  stdout.writeln('  seed derivation        dailySeed(y, m, d) — a pure function '
+      'of the date;');
+  stdout.writeln('                         the calendar is read in '
+      'lib/main.dart, never in lib/game/');
+  stdout.writeln('');
+
+  final Stopwatch sw = Stopwatch()..start();
+  final List<String> failing = <String>[];
+  final Set<int> seeds = <int>{};
+  double worstMargin = double.infinity;
+  String worstDate = '';
+
+  for (int n = 0; n < days; n++) {
+    final DateTime d = first.add(Duration(days: n));
+    final int seed = dailySeed(d.year, d.month, d.day);
+    seeds.add(seed);
+    final ProofResult r = prover.prove(Course.fromSeed(seed, 0, window));
+    if (!r.survivable) {
+      failing.add('${d.toIso8601String().substring(0, 10)} (seed $seed, '
+          '${r.cause?.name} at obstacle ${r.deathObstacleIndex})');
+    }
+    // Margins are a bisection and cost about fifteen searches each, so they are
+    // measured on a sample rather than on every date.
+    if (n % 25 == 0) {
+      final double m =
+          tightestMargin(Course.fromSeed(seed, 0, window), prover: prover);
+      if (m < worstMargin) {
+        worstMargin = m;
+        worstDate = d.toIso8601String().substring(0, 10);
+      }
+    }
+  }
+  sw.stop();
+
+  stdout.writeln('  dates checked          $days');
+  stdout.writeln('  distinct seeds         ${seeds.length}');
+  stdout.writeln('  PASS (survivable)      ${days - failing.length}');
+  stdout.writeln('  FAIL (unsurvivable)    ${failing.length}');
+  stdout.writeln('  tightest margin        '
+      '${worstMargin.toStringAsFixed(5)} on $worstDate  '
+      '(car height is ${GameModel.carHeight})');
+  stdout.writeln('  wall time              '
+      '${(sw.elapsedMilliseconds / 1000).toStringAsFixed(1)} s');
+
+  if (seeds.length != days) {
+    _fail('${days - seeds.length} date(s) share a seed with another date; the '
+        'daily challenge is not daily');
+  }
+  if (failing.isNotEmpty) {
+    _fail('unsurvivable daily courses: ${failing.take(10).join("; ")}');
+  }
+  if (worstMargin <= GameModel.carHeight) {
+    _fail('the tightest daily margin is $worstMargin, under one car height');
+  }
 }
 
 // =============================================================================
