@@ -45,6 +45,8 @@ import 'package:flappymiata/game/game_model.dart';
 import 'package:flappymiata/game/replay.dart';
 import 'package:flappymiata/ui/assist.dart';
 
+import 'package:flappymiata/main.dart' show Autopilot;
+
 import '../tool/headless_sim.dart';
 import '../tool/solver_bot.dart';
 
@@ -558,4 +560,85 @@ void main() {
       expect(solver.score, greaterThan(hold.score));
     });
   });
+
+  // ===========================================================================
+  // THE AUTOPILOT IS THE SAME BOT
+  // ===========================================================================
+  //
+  // `lib/main.dart` carries its own copy of this policy, because `tool/` is not
+  // on the app's import path and a shipped APK cannot reach a `dart run`
+  // script. Two copies of a decision are two chances to drift, and drift here
+  // would be invisible in the worst possible way: the frame-time measurement
+  // would go on reporting numbers, just about a game nobody plays.
+  //
+  // So the comment in `lib/main.dart` that says "these two agree" is not left
+  // as a comment. This drives both over the same run and compares them frame by
+  // frame.
+  group('Autopilot matches tool/solver_bot.dart', () {
+    test('the two policies make the same decision on every frame of a run', () {
+      final Autopilot autopilot = Autopilot();
+      final Policy reference = solverPolicy();
+
+      // Driven by the REFERENCE, so both are asked about the same trajectory.
+      // Letting each drive its own run would compare two different games and
+      // would pass even if they disagreed — the first disagreement would put
+      // the cars in different places and every frame after it would be
+      // incomparable rather than equal.
+      final ReplayRecorder recorder = ReplayRecorder(seed: 0);
+      int frames = 0;
+      int taps = 0;
+      while (!recorder.finished && frames < 3600) {
+        final bool wanted = reference(recorder.model, recorder.frame);
+        expect(
+          autopilot.wantsTap(recorder.model, recorder.frame),
+          wanted,
+          reason: 'the two policies disagreed on frame ${recorder.frame}',
+        );
+        if (wanted) {
+          recorder.tap();
+          taps++;
+        }
+        recorder.step();
+        frames++;
+      }
+
+      // A negative assertion is worth what the fixture's ability to violate it
+      // is worth. A run that never tapped, or that died in the first second,
+      // would agree about nothing interesting and pass forever.
+      expect(frames, greaterThan(1800),
+          reason: 'the run was too short to compare anything');
+      expect(taps, greaterThan(20),
+          reason: 'the run barely tapped, so agreement means little');
+      expect(recorder.model.score, greaterThan(10),
+          reason: 'the run has to get somewhere for the comparison to bite');
+    });
+
+    test('it survives a restart, which is what a measurement run does', () {
+      // The autopilot is stateful — it caches a backward pass — and the game
+      // restarts it the instant a run ends so that a sixty-second measurement
+      // is sixty seconds of play. A cache that came back stale would make the
+      // second run of a measurement a different bot from the first.
+      final Autopilot autopilot = Autopilot();
+
+      int scoreOf(int runIndex) {
+        final ReplayRecorder recorder = ReplayRecorder(seed: 0);
+        while (!recorder.finished && recorder.frame < 1800) {
+          if (autopilot.wantsTap(recorder.model, recorder.frame)) {
+            recorder.tap();
+          }
+          recorder.step();
+        }
+        return recorder.model.score;
+      }
+
+      final int first = scoreOf(0);
+      autopilot.reset();
+      final int second = scoreOf(1);
+      expect(second, first,
+          reason: 'the same bot on the same course scored differently after a '
+              'restart, so its cache is carrying state across runs');
+      expect(first, greaterThan(10));
+    });
+  });
+
 }

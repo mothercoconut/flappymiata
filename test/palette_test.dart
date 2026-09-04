@@ -18,9 +18,14 @@
 ///
 /// WHAT THE SCAN DOES NOT COVER, stated rather than left to be discovered:
 ///
-///   * `lib/dev/` and `lib/game/` are not scanned. `lib/game/` is pure Dart with
-///     no Flutter import at all and therefore cannot name a colour; `lib/dev/`
-///     is a developer harness that never ships.
+///   * `lib/game/` is not scanned. It is pure Dart with no Flutter import at
+///     all and therefore cannot name a colour.
+///
+///     This clause used to name `lib/dev/` as a second exemption — a developer
+///     harness with its own entrypoint. That directory has been deleted, so the
+///     exemption went with it. Worth noting because an exemption is the one kind
+///     of claim that fails silently: nothing about an unscanned directory that
+///     no longer exists would ever have gone red.
 ///   * Whole-line comments are stripped before scanning and trailing comments
 ///     are not, so a colour literal written after code on the same line as a
 ///     `//` would be reported. That is the failure direction to prefer: it

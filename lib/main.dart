@@ -17,11 +17,17 @@
 library;
 
 import 'dart:async';
+// PREFIXED, and it has to be: `package:flame/game.dart` exports a Flame
+// `Timer` of its own — a game-loop countdown, not a scheduler — and the two
+// names collide at this import. The prefix says which one is meant instead of
+// leaving it to whichever import happens to be listed last.
+import 'dart:async' as async show Timer;
 import 'dart:ui' as ui;
 
 import 'package:flame/components.dart';
 import 'package:flame/events.dart';
 import 'package:flame/game.dart';
+import 'package:flutter/scheduler.dart' show FrameTiming, SchedulerBinding;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
@@ -46,7 +52,8 @@ import 'package:flappymiata/ui/palette.dart' as palette;
 // WHY THIS IS SPELLED OUT RATHER THAN LEFT TO CHANCE: the obstacles scroll
 // across the FULL width of the screen, so the score is not tucked away in a
 // safe corner — every pipe passes over it, a few seconds after the run starts.
-// The dev harness hit exactly this: it painted the world onto the canvas AFTER
+// The dev harness that used to live in `lib/dev/` — deleted once this file
+// superseded it — hit exactly this: it painted the world onto the canvas AFTER
 // the component tree had already drawn, which puts the pipes over the text
 // unconditionally and no component priority can undo it. An ordering that
 // depends on which line of code ran last is invisible in review; an ordering
@@ -136,7 +143,78 @@ int todaysCourseSeed() {
 /// and its paints out of a release build entirely while it is false.
 const bool kShowCollisionBoxes = false;
 
+/// Lets the game play itself, so a frame-time measurement measures the game
+/// being PLAYED rather than the game sitting on a menu.
+///
+/// ============================================================================
+/// WHY A MEASUREMENT NEEDS THIS AND A METRONOME WILL NOT DO
+/// ============================================================================
+///
+/// "Is the frame time good" is answered by running the game for a minute and
+/// reading the frame histogram off the device. That only means something if the
+/// minute was spent doing the expensive thing. The expensive frames here are
+/// the ones with obstacles on screen, a ghost being replayed beside the live
+/// car, and a score that keeps re-laying-out — i.e. the frames of an ACTUAL
+/// RUN.
+///
+/// Tapping on a fixed cadence does not produce those. The difficulty ramp moves
+/// the scroll speed and the gap height as the score climbs, and a fixed cadence
+/// was tuned against neither: `tool/solver_bot.dart` records that the stock
+/// `holdAltitude` policy now scores ZERO on the shipped course — it dies on the
+/// first obstacle. A minute of that is a minute of the game-over screen, and
+/// the histogram it produces is a histogram of a static card.
+///
+/// So the autopilot drives with the SAME policy `tool/solver_bot.dart` uses:
+/// the assist solver's own surviving-state search, coasting while coasting is
+/// survivable and tapping on the frame it stops being. That bot plays properly,
+/// so the minute is spent on the frames that cost something.
+///
+/// ============================================================================
+/// WHY IT IS FREE IN A NORMAL BUILD
+/// ============================================================================
+///
+/// `bool.fromEnvironment` with no `--dart-define` is a CONST false, so every
+/// `if (kAutopilot)` below is a branch the AOT compiler proves unreachable and
+/// drops, along with everything only that branch reaches. Same mechanism as
+/// [kShowCollisionBoxes] above. The measured cost of the whole feature in a
+/// shipped APK is zero bytes, and that is checked by building both ways and
+/// comparing — not by trusting this paragraph.
+///
+/// Build the instrumented APK with:
+///
+///     flutter build apk --release --dart-define=AUTOPILOT=true
+///
+/// WHAT IT PINS, AND WHY EACH ONE: a measurement has to be the same measurement
+/// twice, so the two sources of run-to-run variation are nailed down. The
+/// course is forced to [classicCourseSeed] instead of today's date, so the run
+/// does not change at midnight or between two machines in different time zones.
+/// The high-score store is put in memory, so a ghost left on the device by an
+/// earlier run cannot add a second car to the screen in one measurement and not
+/// the other.
+const bool kAutopilot = bool.fromEnvironment('AUTOPILOT');
+
 void main() {
+  // Both statements are inside a `kAutopilot` branch the compiler removes from
+  // a normal build, so `main` in a shipped APK is the single `runApp` it has
+  // always been.
+  if (kAutopilot) {
+    // The binding has to exist before a timings callback can be attached, and
+    // `runApp` would not have created it yet. Idempotent — `runApp` calls the
+    // same thing and gets the instance already made.
+    WidgetsFlutterBinding.ensureInitialized();
+    final FrameTimingProbe probe = FrameTimingProbe()..start();
+
+    // Reported on a wall-clock timer rather than on a frame count, because the
+    // whole question is whether frames are arriving on time: a counter driven
+    // by frames would stretch its own reporting interval by exactly the amount
+    // of lateness it exists to measure, and a run that stalled would go quiet
+    // instead of shouting.
+    int elapsed = 0;
+    async.Timer.periodic(const Duration(seconds: 5), (async.Timer _) {
+      elapsed += 5;
+      probe.report('t=${elapsed}s');
+    });
+  }
   runApp(const FlappyMiataApp());
 }
 
@@ -210,8 +288,18 @@ class FlappyMiataGame extends FlameGame
   final HighScoreStore highScoreStore;
 
   FlappyMiataGame({int? courseSeed, HighScoreStore? highScoreStore})
-    : courseSeed = courseSeed ?? todaysCourseSeed(),
-      highScoreStore = highScoreStore ?? SharedPreferencesHighScoreStore();
+    : // An explicit argument always wins — the tests pass both, and the
+      // autopilot must not be able to overrule a caller that said what it
+      // wanted. Only the DEFAULTS change under [kAutopilot], and both of them
+      // change for the same reason: a frame-time measurement has to be
+      // repeatable, so neither the calendar nor whatever is left in the
+      // device's preferences may decide what gets drawn.
+      courseSeed =
+          courseSeed ?? (kAutopilot ? classicCourseSeed : todaysCourseSeed()),
+      highScoreStore = highScoreStore ??
+          (kAutopilot
+              ? InMemoryHighScoreStore()
+              : SharedPreferencesHighScoreStore());
 
   /// The live run: the model, plus the record of which frames were taps.
   ///
@@ -320,6 +408,20 @@ class FlappyMiataGame extends FlameGame
   /// The current backward pass, reused for about a second. Rebuilt when it stops
   /// covering the frame the run is on, and thrown away on a restart.
   AssistPlan? _assistPlan;
+
+  /// The bot that plays the game while a measurement is running, or null in
+  /// every normal build.
+  ///
+  /// SEPARATE FROM [_assist], and it has to be. Assist mode is a thing the
+  /// player switches on to be SHOWN where to go; this is a thing that DRIVES.
+  /// They happen to consult the same solver, but sharing one would mean the
+  /// measurement could not be taken with the highlight off, and turning the
+  /// highlight off mid-measurement would silently stop the car.
+  ///
+  /// Built eagerly rather than lazily because [kAutopilot] is a compile-time
+  /// constant: when it is false this initialiser is a branch the compiler
+  /// discards, and with it every reference to [Autopilot].
+  final Autopilot? _autopilot = kAutopilot ? Autopilot() : null;
 
   /// What to draw this frame, or null when there is nothing to say.
   ///
@@ -702,6 +804,7 @@ class FlappyMiataGame extends FlameGame
     // advice about a moment that has not happened yet.
     _assistPlan = null;
     _advice = null;
+    _autopilot?.reset();
 
     final Replay? best = _ghostSource;
     _ghost = best == null ? null : _ghostPlayerFor(best);
@@ -756,6 +859,21 @@ class FlappyMiataGame extends FlameGame
       // device that stutters.
       final int steps = _clock.stepsFor(dt);
       for (int i = 0; i < steps; i++) {
+        // THE BOT'S TAP LANDS EXACTLY WHERE A PLAYER'S WOULD. `tap()` queues,
+        // and the queued tap is spent by the very next `step()` before that
+        // frame's physics — so deciding here, immediately above the step, gives
+        // the bot the same `flap-then-tick` frame that `tool/headless_sim.dart`
+        // hands its policies and that the fairness prover searches over. A
+        // decision taken anywhere else in this method would be a decision about
+        // a different frame, and the bot would be measuring a game the tests
+        // have never checked.
+        //
+        // Dropped entirely from a normal build: `_autopilot` is initialised
+        // from a const false, so the compiler knows this is dead.
+        if (_autopilot != null && _autopilot.wantsTap(_run.model, _run.frame)) {
+          _run.tap();
+        }
+
         _run.step();
 
         // The ghost only moves once the live run has actually started. Until the
@@ -767,6 +885,16 @@ class FlappyMiataGame extends FlameGame
       }
 
       _captureFinishedRun();
+
+      // A measurement must not spend its last forty seconds on the game-over
+      // card. Restarting the moment the run ends keeps the minute full of the
+      // frames worth measuring — and it deliberately keeps the EXPENSIVE ones,
+      // because a restart allocates a fresh recorder and a fresh ghost player,
+      // which is the heaviest single frame the game ever has. Hiding that from
+      // the histogram would be measuring a kinder game than the one that ships.
+      if (_autopilot != null && _run.finished) {
+        _startRun();
+      }
       _updateAssist();
 
       // The decoration's own clock. Inside the `!_paused` branch with
@@ -874,6 +1002,274 @@ class FlappyMiataGame extends FlameGame
   }
 }
 
+/// Collects the engine's own frame timings and prints them where `adb logcat`
+/// can read them.
+///
+/// ============================================================================
+/// WHY THIS EXISTS WHEN `adb shell dumpsys gfxinfo` ALREADY REPORTS JANK
+/// ============================================================================
+///
+/// It reports jank for the ANDROID VIEW HIERARCHY, drawn by HWUI. A Flutter app
+/// in its default render mode does not draw there. It is handed a
+/// `SurfaceView` — visible in `dumpsys SurfaceFlinger --list` as
+/// `SurfaceView[com.allen.flappymiata/...](BLAST)` — and the engine's raster
+/// thread paints straight into that surface's buffers, bypassing HWUI
+/// completely.
+///
+/// The consequence, measured on this app rather than assumed: after the game
+/// had been playing for minutes, `dumpsys gfxinfo com.allen.flappymiata`
+/// reported `Total frames rendered: 1`. That one frame is the Android view that
+/// HOLDS the surface being laid out once. Every frame of the actual game is
+/// invisible to it.
+///
+/// So the honest reading of a "0% janky" from gfxinfo on this app is not "the
+/// game is smooth" — it is "gfxinfo did not see the game". A measurement whose
+/// instrument cannot observe the thing being measured returns the same answer
+/// whatever the answer should have been, and that is worse than no measurement,
+/// because it looks like one.
+///
+/// ============================================================================
+/// WHAT IS MEASURED INSTEAD
+/// ============================================================================
+///
+/// `SchedulerBinding.addTimingsCallback` is the engine's own report, one record
+/// per frame the engine actually presented. [FrameTiming.totalSpan] is the
+/// whole span from the vsync that started the frame to the moment the raster
+/// thread finished it — i.e. the number that has to fit inside the display's
+/// frame budget or the viewer sees a stutter. That is the number binned below,
+/// and `buildDuration` and `rasterDuration` are kept beside it so a slow frame
+/// can be blamed on the right thread.
+///
+/// Dropped from a normal build by the same const-false mechanism as everything
+/// else here: building with and without `--dart-define=AUTOPILOT=true` produced
+/// `libapp.so` files of identical size on two of the three ABIs.
+class FrameTimingProbe {
+  /// The display's frame budget in microseconds.
+  ///
+  /// 60 Hz is asserted rather than assumed — [start] reads the real refresh
+  /// rate off the view and complains in the log if it is not what this says, so
+  /// a run on a 90 or 120 Hz panel cannot be scored against the wrong deadline
+  /// in silence.
+  static const int budgetMicros = 16667;
+
+  /// One bucket per millisecond up to [_buckets] − 1, and everything slower in
+  /// the last one. Milliseconds, because that is the unit a frame budget is
+  /// argued about in.
+  static const int _buckets = 64;
+
+  final List<int> _total = List<int>.filled(_buckets, 0);
+  final List<int> _build = List<int>.filled(_buckets, 0);
+  final List<int> _raster = List<int>.filled(_buckets, 0);
+
+  /// `buildDuration + rasterDuration` — the WORK a frame cost, as opposed to
+  /// the wall-clock span it occupied.
+  ///
+  /// WHY BOTH THIS AND [_total] ARE KEPT, because the difference between them
+  /// is the whole trap in this measurement: [FrameTiming.totalSpan] runs from
+  /// the vsync that scheduled the frame to the instant the raster thread
+  /// finished it, and those two threads are PIPELINED — frame n+1 is being
+  /// built while frame n is still being rasterised. So a totalSpan of 20 ms is
+  /// entirely normal on a renderer that is comfortably holding 60 fps, and
+  /// scoring it against a 16.667 ms budget reports a 100% failure for a game
+  /// nobody would call janky. This histogram is the number that has to fit.
+  final List<int> _work = List<int>.filled(_buckets, 0);
+
+  /// Gaps between the vsyncs consecutive frames were scheduled against, in
+  /// whole frame intervals: 1 means the frame arrived on the very next vsync,
+  /// 2 means one vsync went by with nothing new to show.
+  ///
+  /// THIS IS THE HONEST JANK SIGNAL. What a player sees is not how long a frame
+  /// took, it is whether the picture changed when the display refreshed. A
+  /// repeated vsync is a stutter and nothing else is.
+  final List<int> _gaps = List<int>.filled(_buckets, 0);
+
+  int _frames = 0;
+  int _over = 0;
+  int _worstMicros = 0;
+
+  /// Vsync intervals that came and went with no new frame — the count Bar 5's
+  /// "zero jank frames" is really asking about.
+  int _missedVsyncs = 0;
+
+  /// The vsync of the previous frame, or -1 before there has been one. The
+  /// first frame has no predecessor and therefore contributes no interval;
+  /// counting it as a gap of one would invent a frame that was never presented.
+  int _lastVsync = -1;
+
+  /// Begins collecting, and states the deadline it is going to score against.
+  ///
+  /// The refresh rate is READ, not assumed. A jank count is a comparison
+  /// against a budget, so a run on a 90 Hz or 120 Hz panel scored against
+  /// 16.667 ms would report a clean sheet while missing a third of its frames —
+  /// and it would report it in exactly the same words as a real pass. Printing
+  /// both numbers means the log carries the evidence that the comparison was
+  /// the right one, rather than the reader having to take it on faith.
+  void start() {
+    final ui.FlutterView? view =
+        SchedulerBinding.instance.platformDispatcher.implicitView;
+    final double hz = view?.display.refreshRate ?? 0;
+    final int measuredBudget = hz > 0 ? (1000000 / hz).round() : 0;
+    debugPrint(
+      'FRAMEPROBE display refreshRate=${hz.toStringAsFixed(2)}Hz '
+      'measuredBudgetUs=$measuredBudget assumedBudgetUs=$budgetMicros '
+      '${measuredBudget != 0 && (measuredBudget - budgetMicros).abs() > 500 ? "MISMATCH — the jank count below is scored against the assumed budget, not this display" : "ok"}',
+    );
+    SchedulerBinding.instance.addTimingsCallback(_record);
+  }
+
+  void _record(List<FrameTiming> timings) {
+    for (final FrameTiming t in timings) {
+      final int total = t.totalSpan.inMicroseconds;
+      _frames++;
+      if (total > budgetMicros) _over++;
+      if (total > _worstMicros) _worstMicros = total;
+      _bump(_total, total);
+      _bump(_build, t.buildDuration.inMicroseconds);
+      _bump(_raster, t.rasterDuration.inMicroseconds);
+      _bump(
+        _work,
+        t.buildDuration.inMicroseconds + t.rasterDuration.inMicroseconds,
+      );
+
+      final int vsync = t.timestampInMicroseconds(ui.FramePhase.vsyncStart);
+      if (_lastVsync >= 0) {
+        // Rounded rather than floored: vsync timestamps carry a little jitter,
+        // so a perfectly consecutive pair can measure 16.4 or 16.9 ms and a
+        // floor would score half of a healthy run as a skipped interval.
+        final int intervals =
+            ((vsync - _lastVsync) / budgetMicros).round().clamp(1, _buckets - 1);
+        _gaps[intervals]++;
+        _missedVsyncs += intervals - 1;
+      }
+      _lastVsync = vsync;
+    }
+  }
+
+  void _bump(List<int> hist, int micros) {
+    // Floor to whole milliseconds. A frame of 16.9 ms lands in bucket 16, so
+    // "bucket 16 and below" is NOT the same as "inside the 16.667 ms budget" —
+    // which is exactly why [_over] is counted against the microsecond value and
+    // never read off this histogram.
+    final int ms = micros ~/ 1000;
+    hist[ms >= _buckets ? _buckets - 1 : ms]++;
+  }
+
+  /// Prints everything collected so far as one line per histogram.
+  ///
+  /// Tagged so `adb logcat -s flutter | findstr FRAMEPROBE` finds it, and
+  /// printed as counts rather than as a verdict: the raw distribution is the
+  /// deliverable, and a reader who disagrees with the jank threshold can
+  /// re-derive their own from these numbers.
+  void report(String label) {
+    final StringBuffer out = StringBuffer()
+      ..write('FRAMEPROBE $label frames=$_frames ')
+      ..write('missedVsyncs=$_missedVsyncs ')
+      ..write('spanOverBudget=$_over ')
+      ..write('budgetUs=$budgetMicros ')
+      ..write('worstSpanUs=$_worstMicros');
+    debugPrint(out.toString());
+    debugPrint('FRAMEPROBE $label gapsInVsyncs=${_dense(_gaps)}');
+    debugPrint('FRAMEPROBE $label workMs=${_dense(_work)}');
+    debugPrint('FRAMEPROBE $label totalSpanMs=${_dense(_total)}');
+    debugPrint('FRAMEPROBE $label buildMs=${_dense(_build)}');
+    debugPrint('FRAMEPROBE $label rasterMs=${_dense(_raster)}');
+  }
+
+  /// The non-empty buckets only, as `ms:count` pairs. A 64-entry line of mostly
+  /// zeroes is a line nobody reads.
+  String _dense(List<int> hist) {
+    final List<String> parts = <String>[];
+    for (int i = 0; i < hist.length; i++) {
+      if (hist[i] != 0) parts.add('$i:${hist[i]}');
+    }
+    return parts.join(' ');
+  }
+}
+
+/// The bot that plays the game during a frame-time measurement.
+///
+/// ============================================================================
+/// THIS IS THE SAME POLICY AS `tool/solver_bot.dart`, AND THAT IS DELIBERATE
+/// ============================================================================
+///
+/// The decision below is a line-for-line restatement of `solverPolicy` in
+/// `tool/solver_bot.dart`. It is a second copy rather than a call, for one
+/// reason worth stating plainly: `tool/` is not on the app's import path — it
+/// is a directory of `dart run` scripts and test helpers — and putting it there
+/// would mean shipping the whole tool directory into the APK to run a bot that
+/// no shipped build can reach.
+///
+/// A second copy is a second chance to drift, so the drift is made visible
+/// rather than trusted: the group `Autopilot matches tool/solver_bot.dart` in
+/// `test/assist_test.dart` drives BOTH this class and `solverPolicy` over the
+/// same run and requires them to make the same decision on every frame. If
+/// somebody improves one and not the other, that test says so, and it says so
+/// about the frame they first disagreed on.
+///
+/// ============================================================================
+/// WHAT THE POLICY IS
+/// ============================================================================
+///
+/// `lib/ui/assist.dart` computes, for a bounded horizon, the exact SET of states
+/// from which some continuation survives. The whole policy is then:
+///
+///   * while coasting keeps the car inside that set, coast;
+///   * on the frame coasting would leave it, tap.
+///
+/// Within one horizon that cannot die, because leaving the set is the
+/// definition of having no future. Across horizons it can — a pass looks a
+/// bounded distance ahead — which is why the game restarts the bot rather than
+/// assuming it plays forever. Full argument in `tool/solver_bot.dart`.
+class Autopilot {
+  /// The search. Allocated once and reused: a pass covers about a second of
+  /// play, so this rebuilds roughly once per second rather than once per frame.
+  final AssistSolver _search = AssistSolver();
+
+  /// The pass currently being read, or null before the first one.
+  AssistPlan? _plan;
+
+  /// Thrown away when a run restarts.
+  ///
+  /// Not strictly required — a pass is anchored to a frame number and
+  /// `covers()` already rejects the frame 0 of a new run — but a cache that is
+  /// cleared where the thing it describes is replaced needs no argument about
+  /// why it is safe to keep.
+  void reset() {
+    _plan = null;
+  }
+
+  /// Whether the bot taps on the frame [model] is about to be stepped through.
+  bool wantsTap(GameModel model, int frame) {
+    // The first tap. A `ready` model does not move at all — `tick` returns the
+    // receiver — so nothing can be planned about it until the run has begun.
+    if (model.state == RunState.ready) return true;
+    if (model.state == RunState.dead) return false;
+
+    AssistPlan? plan = _plan;
+    if (plan == null || !plan.isCurrent || !plan.covers(frame)) {
+      plan = _search.plan(model, frame);
+      _plan = plan;
+    }
+    final AssistAdvice? advice = plan?.adviseAt(model, frame);
+
+    // No pass could be built — no obstacle ahead, or a state the search cannot
+    // represent. Coasting is the honest answer; inventing a tap here would be
+    // exactly the guess this bot exists to avoid.
+    if (advice == null) return false;
+
+    // Doing nothing still leaves a future, so do nothing. This is the branch
+    // that runs on almost every frame.
+    if (advice.latestSafeCoast >= 1) return false;
+
+    // Coasting one more frame leaves the surviving set, so this is the frame to
+    // tap on — if tapping is still one of the moves that survives. When it is
+    // not the car is already lost inside this horizon and the tap changes
+    // nothing; it is still made, because a doomed car flying is better viewing
+    // than a doomed car falling, and nothing downstream reads it either way.
+    return advice.flapNow || advice.doomed;
+  }
+}
+
 /// The sky, the hills, the clouds and the ground: everything behind the game.
 ///
 /// ============================================================================
@@ -914,10 +1310,58 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
   static final Paint _cloud = Paint()..color = const Color(palette.cloud);
   static final Paint _ground = Paint()..color = const Color(palette.ground);
 
+  // ---------------------------------------------------------------------------
+  // WHERE THE GROUND STARTS. Three shapes have to agree about this or the
+  // backdrop grows a seam: the sky stops here, the horizon band starts here,
+  // and the hills close their silhouette on this line. It used to be the
+  // literal `0.70` written out in four places, which is three chances for one
+  // of them to be edited alone.
+  //
+  // Fractions of the screen HEIGHT, like everything else this game draws, so a
+  // rotation or a different device changes no arithmetic.
+  // ---------------------------------------------------------------------------
+
+  /// The horizon: the bottom of the sky and the top of the grey band.
+  static const double _horizonY = 0.70;
+
+  /// The top of the ground, and the bottom of the grey band.
+  static const double _groundY = 0.76;
+
+  /// The hill silhouette, kept between frames.
+  ///
+  /// REBUILT ONLY WHEN THE SCREEN CHANGES SIZE. A `Path` is not free: building
+  /// one allocates, and handing a fresh object to the rasteriser every frame
+  /// throws away whatever it had already worked out about the last one. The
+  /// shape here is a function of the screen size and nothing else — it does not
+  /// depend on the parallax, which is applied as a canvas TRANSLATION rather
+  /// than by moving the points — so on a phone that is not being rotated this
+  /// is built once for the life of the process instead of a hundred and twenty
+  /// times a second (twice per frame, once per tiled copy).
+  Path? _hills;
+  Size? _hillsFor;
+
   @override
   void render(Canvas canvas) {
     final Size size = game.size.toSize();
-    canvas.drawRect(Offset.zero & size, _sky);
+
+    // ONLY DOWN TO THE HORIZON, not the whole screen.
+    //
+    // Everything below [_horizonY] is covered by two fully opaque rectangles —
+    // the band and the ground, both `0xFF` in `lib/ui/palette.dart` — so the
+    // gradient that used to be painted down there was never visible in a single
+    // frame. On a device with a real GPU that waste is invisible; on the
+    // software rasteriser in the emulator this is measured on, a full-screen
+    // GRADIENT fill is the most expensive single operation in the frame, and
+    // 30% of it was being thrown away.
+    //
+    // The picture is unchanged, and it is unchanged for a reason worth stating:
+    // the shader is anchored to absolute pixels 0..900 rather than to the
+    // rectangle it fills, so shrinking the rectangle moves no colour. It only
+    // stops painting pixels that something opaque was about to cover.
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, size.width, size.height * _horizonY),
+      _sky,
+    );
 
     // How far each layer has slid, as a fraction of one screen width in [0, 1).
     // Frozen at whatever it was when motion was last reduced.
@@ -937,11 +1381,21 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
     _tile(canvas, size, cloudShift, _drawClouds);
 
     canvas.drawRect(
-      Rect.fromLTWH(0, size.height * 0.70, size.width, size.height * 0.06),
+      Rect.fromLTWH(
+        0,
+        size.height * _horizonY,
+        size.width,
+        size.height * (_groundY - _horizonY),
+      ),
       _horizon,
     );
     canvas.drawRect(
-      Rect.fromLTWH(0, size.height * 0.76, size.width, size.height * 0.24),
+      Rect.fromLTWH(
+        0,
+        size.height * _groundY,
+        size.width,
+        size.height * (1 - _groundY),
+      ),
       _ground,
     );
   }
@@ -962,16 +1416,29 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
   }
 
   void _drawHills(Canvas canvas, Size size) {
+    canvas.drawPath(_hillPath(size), _hill);
+  }
+
+  /// The hill silhouette at [size], built on the first call and on any resize.
+  ///
+  /// The first and last points are both on the horizon, which is what makes the
+  /// two tiled copies join invisibly — where one ends the next begins at the
+  /// same height.
+  Path _hillPath(Size size) {
+    final Path? cached = _hills;
+    if (cached != null && _hillsFor == size) return cached;
     final Path hills = Path()
-      ..moveTo(0, size.height * 0.70)
+      ..moveTo(0, size.height * _horizonY)
       ..lineTo(size.width * 0.16, size.height * 0.57)
-      ..lineTo(size.width * 0.31, size.height * 0.70)
+      ..lineTo(size.width * 0.31, size.height * _horizonY)
       ..lineTo(size.width * 0.49, size.height * 0.53)
-      ..lineTo(size.width * 0.68, size.height * 0.70)
+      ..lineTo(size.width * 0.68, size.height * _horizonY)
       ..lineTo(size.width * 0.84, size.height * 0.59)
-      ..lineTo(size.width, size.height * 0.70)
+      ..lineTo(size.width, size.height * _horizonY)
       ..close();
-    canvas.drawPath(hills, _hill);
+    _hills = hills;
+    _hillsFor = size;
+    return hills;
   }
 
   void _drawClouds(Canvas canvas, Size size) {
