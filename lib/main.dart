@@ -16,6 +16,7 @@
 /// finished.
 library;
 
+import 'dart:async';
 import 'dart:ui' as ui;
 
 import 'package:flame/components.dart';
@@ -24,15 +25,17 @@ import 'package:flame/game.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import 'package:flappymiata/game/course_seed.dart';
 import 'package:flappymiata/game/game_model.dart';
+import 'package:flappymiata/game/replay.dart';
 
 // -----------------------------------------------------------------------------
 // DRAW ORDER.
 //
 // Flame paints sibling components in ascending `priority`: the lowest number is
 // laid down first and everything after it lands on top. So the layer that has
-// to stay readable needs the HIGHER number, and these two constants are the
-// only place that decision is recorded.
+// to stay readable needs the HIGHER number, and these constants are the only
+// place that decision is recorded.
 //
 // WHY THIS IS SPELLED OUT RATHER THAN LEFT TO CHANCE: the obstacles scroll
 // across the FULL width of the screen, so the score is not tucked away in a
@@ -42,10 +45,26 @@ import 'package:flappymiata/game/game_model.dart';
 // unconditionally and no component priority can undo it. An ordering that
 // depends on which line of code ran last is invisible in review; an ordering
 // that is a number attached to a layer is not.
+//
+// WHY THE CAR MOVED OUT OF THE WORLD LAYER WHEN THE GHOST ARRIVED: the ghost
+// has to sit BEHIND the live car and IN FRONT OF the pipes, which is a
+// three-way ordering and therefore three layers. Leaving all of it inside one
+// component would have made that ordering a matter of which `canvas.draw` call
+// came first inside a `render` method — exactly the invisible, line-order
+// dependency the paragraph above exists to rule out. Pipes still scroll the
+// full width and still cover everything numbered below them, ghost included.
 // -----------------------------------------------------------------------------
 
-/// Pipes and car. Lowest, so they are painted underneath everything else.
+/// The pipes. Lowest of the playfield layers, so both cars are drawn on top of
+/// them.
 const int _worldPriority = 0;
+
+/// The recorded best run's car. Above the pipes so it can be seen at all,
+/// below the live car so it can never obscure the one the player is steering.
+const int _ghostPriority = 10;
+
+/// The live car.
+const int _carPriority = 20;
 
 /// The collision-box overlay. Between the world and the HUD on purpose: it has
 /// to cover the pipes it is describing, and it must not cover the score.
@@ -55,6 +74,39 @@ const int _debugPriority = 50;
 /// it, so a layer added later — `lib/ui/` will want some — has somewhere to sit
 /// in between without anyone renumbering these.
 const int _hudPriority = 100;
+
+/// The course everybody gets when the daily challenge is switched off: seed 0,
+/// which `lib/game/course_seed.dart` proves is bit-for-bit the shipped hash.
+const int classicCourseSeed = 0;
+
+/// Whether the app plays today's date-seeded course or the classic one.
+///
+/// `const`, so switching it off removes the calendar lookup from the build
+/// entirely rather than leaving a branch nobody takes.
+const bool kDailyChallenge = true;
+
+/// Today's course seed.
+///
+/// THE CALENDAR IS READ HERE AND NOWHERE ELSE. `lib/game/` has no clock in it —
+/// no frame duration, no calendar, no random number generator — and that is not
+/// a stylistic preference, it is what makes every rule in there a function of
+/// its arguments and therefore testable by comparing it to an expected value.
+/// `dailySeed` accordingly takes a year, a month and a day as three plain
+/// integers and has no idea which of them is today. This file is a renderer, it
+/// already knows about wall-clock time because Flame hands it a frame duration
+/// sixty times a second, and one more fact about the real world costs it
+/// nothing.
+///
+/// LOCAL date rather than UTC, deliberately: "today's challenge" should change
+/// at the player's midnight, not at Greenwich's. The consequence is that two
+/// players in different time zones can briefly be on different days' courses,
+/// which is the right trade — the alternative is a challenge that rolls over in
+/// the middle of somebody's afternoon.
+int todaysCourseSeed() {
+  if (!kDailyChallenge) return classicCourseSeed;
+  final DateTime now = DateTime.now();
+  return dailySeed(now.year, now.month, now.day);
+}
 
 /// FLIP THIS TO SEE THE COLLISION BOXES. One boolean, at the top of the file,
 /// off in anything shipped.
@@ -112,31 +164,75 @@ class FlappyMiataApp extends StatelessWidget {
 /// Component and reports every point inside the canvas as its own, so the whole
 /// surface becomes the tap target with no invisible button to size or place.
 class FlappyMiataGame extends FlameGame with TapCallbacks {
-  /// The single source of truth about the run.
-  ///
-  /// REPLACED EVERY FRAME, NEVER MUTATED. `GameModel` is immutable and `tick`
-  /// is a pure function from (snapshot, dt) to the next snapshot, so "advance
-  /// the game" means "point this field at the object that came back". Two
-  /// things fall out of that, and both are why the model was written this way:
-  ///
-  ///  - Nothing can change the game behind this renderer's back. The snapshot
-  ///    being drawn stays true until the line in [update] deliberately replaces
-  ///    it, so a half-updated frame is not expressible.
-  ///  - The rules stay testable without a screen. `flutter test` runs thousands
-  ///    of ticks in milliseconds precisely because no renderer is involved in
-  ///    producing them — see `lib/game/README.md`.
-  ///
-  /// The consequence to remember when editing this file: the RETURN VALUE of
-  /// `tick`, `flap` and `reset` is the game. Calling one and dropping the
-  /// result does nothing at all.
-  GameModel _model = const GameModel.ready();
+  /// Which course this session plays. Fixed for the life of the game object, so
+  /// a restart puts the player on the same obstacles — otherwise "beat your
+  /// ghost" would be a different question every attempt.
+  final int courseSeed;
 
-  /// Read-only view of the current snapshot, for anything that draws.
+  FlappyMiataGame({int? courseSeed})
+    : courseSeed = courseSeed ?? todaysCourseSeed();
+
+  /// The live run: the model, plus the record of which frames were taps.
+  ///
+  /// WHY A RECORDER RATHER THAN A BARE `GameModel`, which is what this used to
+  /// be: the model is still the single source of truth about the run and is
+  /// still immutable and still replaced rather than mutated. The recorder is a
+  /// thin wrapper that does exactly two extra things — it steps at a FIXED
+  /// timestep, and it writes down the frames the player tapped on. Both are
+  /// required for the run to be reproducible later, and neither is a rule.
+  ///
+  /// The consequence to remember when editing this file: the run is advanced by
+  /// `_run.step()` and nothing else. There is no `_model = ...` assignment left
+  /// to forget the return value of.
+  late ReplayRecorder _run = ReplayRecorder(seed: courseSeed);
+
+  /// Turns Flame's real, jittery frame durations into whole fixed steps.
+  ///
+  /// WHY THE MODEL NO LONGER SEES `dt` DIRECTLY: it used to, and the game
+  /// played perfectly well — but the run was then a function of the device's
+  /// frame pacing, so it could not be written down. Two players who tapped at
+  /// exactly the same moments would get different runs on a 60 Hz and a 120 Hz
+  /// screen. Spending real time in fixed [replayFrameSeconds] chunks makes the
+  /// simulation frame-rate independent, which is what a recording, a ghost and
+  /// a verified score all rest on. See `lib/game/replay.dart`.
+  final FixedStepAccumulator _clock = FixedStepAccumulator();
+
+  /// The best run of this session, kept so the next one can race it.
+  ///
+  /// IN MEMORY ONLY, and deliberately: writing it to disk would mean a storage
+  /// dependency, and this repo does not add one without being asked. The
+  /// replay is a seed plus a list of small integers — a run code, which
+  /// `lib/game/run_code.dart` will already turn into a short string — so
+  /// persisting it later is a one-line change to this field and nothing else.
+  Replay? _bestRun;
+
+  /// The score [_bestRun] achieved.
+  int _bestScore = 0;
+
+  /// The recorded best run, being replayed alongside the live one.
+  ///
+  /// Null until there is a best run to race, and null again for the first run
+  /// of a session. It holds a `ReplayPlayer`, which is the SAME driver the
+  /// verifier and the tests use — the ghost is not a special rendering-side
+  /// simulation, it is the recording being executed.
+  ReplayPlayer? _ghost;
+
+  /// Read-only view of the live snapshot, for anything that draws.
   ///
   /// Public so that `lib/ui/` can render from it without this file handing out
-  /// a way to change it. Assignment stays private: the only legal ways to move
-  /// the run on are the model's own `tick`, `flap` and `reset`.
-  GameModel get model => _model;
+  /// a way to change it.
+  GameModel get model => _run.model;
+
+  /// The ghost's snapshot, or null when there is nothing to race.
+  GameModel? get ghostModel => _ghost?.model;
+
+  /// The car sprite, loaded once and shared by the two layers that draw a car.
+  ///
+  /// Owned here rather than by either layer because both need it and neither
+  /// owns the other. Loading it twice would put the same 286x120 image in
+  /// memory twice and, worse, let the two layers disagree about whether it had
+  /// finished loading.
+  ui.Image? carImage;
 
   late final _ScorePanel _panel;
 
@@ -147,12 +243,35 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
   Future<void> onLoad() async {
     await super.onLoad();
 
+    // THE SPRITE IS LOADED WITHOUT BLOCKING THE GAME ON IT.
+    //
+    // Flame does not consider a game loaded until every `onLoad` it is waiting
+    // on has returned, and until then there is no game loop and no input — so
+    // awaiting a file read here means the whole game is held up by an image.
+    // Both car layers already draw nothing while [carImage] is null, so the
+    // cost of not waiting is at most a frame or two with the pipes and the
+    // backdrop but no car, and the benefit is that the game is alive, ticking
+    // and accepting taps from its very first frame.
+    //
+    // It also makes the game testable. `flutter test` resolves an asset through
+    // real asynchronous I/O that a `pump()` alone never advances, so a game
+    // that blocks on one never finishes loading in a widget test — which is
+    // exactly why the ghost wiring in `test/widget_test.dart` could not be
+    // checked at all until this stopped being awaited.
+    unawaited(_loadCarSprite());
+
     _panel = _ScorePanel();
-    // Added in this order for readability only. The priorities the two classes
-    // carry are what actually decide who covers whom, so swapping these two
+    // Added in this order for readability only. The priorities the classes
+    // carry are what actually decide who covers whom, so reordering these
     // entries changes nothing on screen — which is the point of using
     // priorities rather than insertion order.
-    await addAll(<Component>[_BackdropLayer(), _WorldLayer(), _panel]);
+    await addAll(<Component>[
+      _BackdropLayer(),
+      _WorldLayer(),
+      _GhostLayer(),
+      _CarLayer(),
+      _panel,
+    ]);
 
     // Added only when it is wanted. The alternative — always add it and return
     // early inside `render` — leaves a component in the tree being asked sixty
@@ -167,43 +286,121 @@ class FlappyMiataGame extends FlameGame with TapCallbacks {
     _panel.text = _hudText;
   }
 
+  /// Decodes the car sprite into [carImage].
+  Future<void> _loadCarSprite() async {
+    final ByteData data = await rootBundle.load(
+      'assets/sprites/miatasprite.png',
+    );
+    final ui.Codec codec = await ui.instantiateImageCodec(
+      data.buffer.asUint8List(),
+    );
+    carImage = (await codec.getNextFrame()).image;
+    codec.dispose();
+  }
+
   /// A tap means "flap" during a run and "start again" once the run is over.
   ///
-  /// The model refuses flaps while dead all by itself, so this branch is about
-  /// intent rather than safety: `reset()` is the deliberate way back, and
-  /// keeping it off `flap()` is what lets the player see the final frame
-  /// instead of having a stray tap wipe it.
+  /// The tap is QUEUED rather than applied here. A touch handler fires whenever
+  /// the operating system feels like it, possibly twice between two frames, and
+  /// a recording can only express input on the frame grid. `ReplayRecorder.tap`
+  /// therefore lands the tap on the next fixed step — which is also what the
+  /// model would have done anyway, since a flap assigns velocity and two flaps
+  /// inside one frame produce exactly one flap's worth of motion.
   @override
   void onTapDown(TapDownEvent event) {
-    _model = _model.state == RunState.dead ? _model.reset() : _model.flap();
+    if (_run.finished) {
+      _startRun();
+    } else {
+      _run.tap();
+    }
     _panel.text = _hudText;
+  }
+
+  /// Begins a fresh run on the same course, and puts the best run so far on the
+  /// track alongside it.
+  void _startRun() {
+    _run = ReplayRecorder(seed: courseSeed);
+
+    final Replay? best = _bestRun;
+    if (best == null) {
+      _ghost = null;
+      return;
+    }
+    final ReplayPlayer ghost = ReplayPlayer(best);
+
+    // SKIP THE GHOST'S OWN THINKING TIME. A recording includes every frame from
+    // the moment the run object was created, including however long its player
+    // sat looking at the "tap to start" screen. Those frames do nothing — the
+    // model is `ready` and `tick` returns the receiver — but replaying them
+    // would leave the ghost idling on the start line while the live car drove
+    // off. Fast-forwarding to the frame of its first tap lines the two runs up
+    // at the moment each of them actually began, which is the only alignment
+    // that makes a race mean anything.
+    //
+    // A recording with NO taps never began at all, so the whole thing is
+    // lead-in: the ghost is wound to its end and parks on the start line, which
+    // is exactly where that run spent every frame of its life.
+    final int leadIn =
+        best.tapFrames.isEmpty ? best.frames : best.tapFrames.first;
+    for (int i = 0; i < leadIn; i++) {
+      ghost.step();
+    }
+    _ghost = ghost;
   }
 
   @override
   void update(double dt) {
     super.update(dt);
 
-    // The ONE place real time enters the model. Flame measures how long the
-    // frame took; the model just receives a number of seconds and has no clock
-    // of its own. That indirection is why an identical run can be replayed
-    // exactly in a test where no real time passes at all.
-    _model = _model.tick(dt);
+    // THE ONE PLACE REAL TIME ENTERS. Flame measures how long the frame took;
+    // the accumulator turns that into a whole number of fixed steps, and the
+    // model never learns that a clock was involved. That indirection is why an
+    // identical run can be replayed exactly in a test where no real time passes
+    // at all — and why the ghost stays in step with the live car on a device
+    // that stutters.
+    final int steps = _clock.stepsFor(dt);
+    for (int i = 0; i < steps; i++) {
+      _run.step();
+
+      // The ghost only moves once the live run has actually started. Until the
+      // first tap the live car is frozen on the start line, and a ghost that
+      // set off without it would be racing nobody.
+      if (_run.model.state != RunState.ready) {
+        _ghost?.step();
+      }
+    }
+
+    // THE FIRST FINISHED RUN IS ALWAYS KEPT, however badly it went. A ghost
+    // that only appeared once somebody scored would leave the player with
+    // nothing to race on exactly the attempts where a reference would help
+    // most, and "my previous attempt" is the comparison a player is actually
+    // making in their head.
+    //
+    // Idempotent: after the first capture `_bestRun` is non-null and
+    // `score > _bestScore` is false, so this does nothing on every later frame.
+    // No "have I already saved this" flag to get out of step with the thing it
+    // is describing.
+    if (_run.finished && (_bestRun == null || _run.model.score > _bestScore)) {
+      _bestScore = _run.model.score;
+      _bestRun = _run.replay;
+    }
 
     _panel.text = _hudText;
   }
 
-  /// The score, plus a hint in the two states where the game is waiting on the
-  /// player. No hint while playing: it would be one more thing sitting over the
-  /// pipes with nothing left to say.
+  /// The score, the best of the session, and a hint in the two states where the
+  /// game is waiting on the player. No hint while playing: it would be one more
+  /// thing sitting over the pipes with nothing left to say.
   String get _hudText {
-    final String score = 'score: ${_model.score}';
-    switch (_model.state) {
+    final String score = 'score: ${_run.model.score}';
+    final String best = _bestRun == null ? '' : '\nbest: $_bestScore';
+    switch (_run.model.state) {
       case RunState.ready:
-        return '$score\ntap to start';
+        return '$score$best\ntap to start';
       case RunState.playing:
-        return score;
+        return '$score$best';
       case RunState.dead:
-        return '$score\ntap to restart';
+        return '$score$best\ntap to restart';
     }
   }
 }
@@ -280,23 +477,6 @@ class _BackdropLayer extends Component with HasGameReference<FlappyMiataGame> {
 class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
   _WorldLayer() : super(priority: _worldPriority);
 
-  /// How much bigger the drawn car is than its collision box.
-  ///
-  /// The hitbox is ~91% of the drawn car. A slightly forgiving hitbox is the
-  /// convention in this genre - it reads as fair, where the reverse reads as
-  /// broken. Any value here is a deliberate design choice, not a fudge.
-  ///
-  /// WHAT THIS REPLACED: `_miataVisualHeightScale = 1.885`, a factor applied to
-  /// the box's HEIGHT with the width then taken from the image's own
-  /// proportions. That could not have worked. The box was 108 x 120 px on the
-  /// test device — nearly square — while the car is 2.383 : 1, so any scale
-  /// that made the height look right made the width 2.93x too large, and the
-  /// nose and tail of the car passed through pipes untouched. The fix was not a
-  /// better constant; it was giving the BOX the sprite's shape, which is what
-  /// `GameModel.carWidth` now does. With the shapes already agreeing, a single
-  /// uniform scale is the only thing left to choose.
-  static const double _spriteOversize = 1.10;
-
   static const double _pipeCapHeight = 44.0;
 
   static final Paint _pipeOutline = Paint()..color = const Color(0xFF153D2B);
@@ -304,75 +484,13 @@ class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
   static final Paint _pipeHighlight = Paint()..color = const Color(0xFF65B96C);
   static final Paint _pipeShadow = Paint()..color = const Color(0xFF205A3A);
 
-  /// Stated rather than left at the default, because the default for
-  /// `drawImageRect` is `FilterQuality.low` — a single bilinear sample, which
-  /// throws source pixels away when an image is minified. `miatasprite.png` is
-  /// a downscaled high-resolution render, not pixel art: 286 source pixels are
-  /// drawn into roughly 195, so at low quality the car's outlines crawl and
-  /// shimmer as it moves. `medium` samples a mipmap chain, averaging the pixels
-  /// being skipped instead of ignoring them. `none` (nearest neighbour) is the
-  /// right answer for pixel art and exactly the wrong one here.
-  static final Paint _spritePaint = Paint()
-    ..filterQuality = FilterQuality.medium
-    ..isAntiAlias = true;
-
-  ui.Image? _miataImage;
-
-  @override
-  Future<void> onLoad() async {
-    await super.onLoad();
-    final ByteData data = await rootBundle.load(
-      'assets/sprites/miatasprite.png',
-    );
-    final ui.Codec codec = await ui.instantiateImageCodec(
-      data.buffer.asUint8List(),
-    );
-    _miataImage = (await codec.getNextFrame()).image;
-    codec.dispose();
-  }
-
   @override
   void render(Canvas canvas) {
-    final ui.Image? miataImage = _miataImage;
-    if (miataImage == null) return;
-
     final Vector2 screen = game.size;
-
     for (final Obstacle obstacle in game.model.obstacles) {
       _drawPipe(canvas, _toPixels(obstacle.topBox, screen), capAtBottom: true);
       _drawPipe(canvas, _toPixels(obstacle.bottomBox, screen));
     }
-
-    // THE CAR IS DRAWN AT ITS HITBOX, scaled by one number on both axes.
-    //
-    // Not "sized from the image and then centred on the box", which is what
-    // this did before and is how the two came apart: the image's proportions
-    // and the box's proportions were two independent facts and nothing made
-    // them agree. The box now carries the sprite's aspect — `GameModel.carWidth`
-    // is derived from `carSpriteAspect` — so drawing into the box IS drawing at
-    // the right shape, and the only decision left is how much bigger the
-    // picture is than the box: [_spriteOversize], one constant, one meaning.
-    //
-    // Centred rather than anchored to an edge, so the forgiveness is even: the
-    // extra 10% hangs off the nose and the tail equally, and off the roof and
-    // the sills equally.
-    final Rect carRect = _toPixels(game.model.carBox, screen);
-    final Rect visualRect = Rect.fromCenter(
-      center: carRect.center,
-      width: carRect.width * _spriteOversize,
-      height: carRect.height * _spriteOversize,
-    );
-    canvas.drawImageRect(
-      miataImage,
-      Rect.fromLTWH(
-        0,
-        0,
-        miataImage.width.toDouble(),
-        miataImage.height.toDouble(),
-      ),
-      visualRect,
-      _spritePaint,
-    );
   }
 
   void _drawPipe(Canvas canvas, Rect box, {bool capAtBottom = false}) {
@@ -416,6 +534,125 @@ class _WorldLayer extends Component with HasGameReference<FlappyMiataGame> {
     canvas.drawRect(opening, _pipeShadow);
   }
 
+}
+
+/// How much bigger the drawn car is than its collision box.
+///
+/// The hitbox is ~91% of the drawn car. A slightly forgiving hitbox is the
+/// convention in this genre - it reads as fair, where the reverse reads as
+/// broken. Any value here is a deliberate design choice, not a fudge.
+///
+/// WHAT THIS REPLACED: `_miataVisualHeightScale = 1.885`, a factor applied to
+/// the box's HEIGHT with the width then taken from the image's own proportions.
+/// That could not have worked. The box was 108 x 120 px on the test device —
+/// nearly square — while the car is 2.383 : 1, so any scale that made the
+/// height look right made the width 2.93x too large, and the nose and tail of
+/// the car passed through pipes untouched. The fix was not a better constant;
+/// it was giving the BOX the sprite's shape, which is what `GameModel.carWidth`
+/// now does. With the shapes already agreeing, a single uniform scale is the
+/// only thing left to choose.
+const double _spriteOversize = 1.10;
+
+/// Draws the car sprite into the hitbox [box], scaled by one number on both
+/// axes.
+///
+/// Not "sized from the image and then centred on the box", which is what this
+/// did before and is how the two came apart: the image's proportions and the
+/// box's proportions were two independent facts and nothing made them agree.
+/// The box now carries the sprite's aspect — `GameModel.carWidth` is derived
+/// from `carSpriteAspect` — so drawing into the box IS drawing at the right
+/// shape, and the only decision left is how much bigger the picture is than the
+/// box: [_spriteOversize], one constant, one meaning.
+///
+/// Centred rather than anchored to an edge, so the forgiveness is even: the
+/// extra 10% hangs off the nose and the tail equally, and off the roof and the
+/// sills equally.
+///
+/// ONE FUNCTION, TWO CALLERS, for the same reason [_toPixels] is one function:
+/// the ghost has to be drawn exactly where the live car would have been on that
+/// frame of its run. A second copy of this arithmetic that drifted by a pixel
+/// would make the ghost a picture of a slightly different game.
+void _drawCar(
+  Canvas canvas,
+  ui.Image image,
+  Box box,
+  Vector2 screen,
+  Paint paint,
+) {
+  final Rect carRect = _toPixels(box, screen);
+  final Rect visualRect = Rect.fromCenter(
+    center: carRect.center,
+    width: carRect.width * _spriteOversize,
+    height: carRect.height * _spriteOversize,
+  );
+  canvas.drawImageRect(
+    image,
+    Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble()),
+    visualRect,
+    paint,
+  );
+}
+
+/// The car the player is steering. Above the ghost, below the HUD.
+class _CarLayer extends Component with HasGameReference<FlappyMiataGame> {
+  _CarLayer() : super(priority: _carPriority);
+
+  /// Stated rather than left at the default, because the default for
+  /// `drawImageRect` is `FilterQuality.low` — a single bilinear sample, which
+  /// throws source pixels away when an image is minified. `miatasprite.png` is
+  /// a downscaled high-resolution render, not pixel art: 286 source pixels are
+  /// drawn into roughly 195, so at low quality the car's outlines crawl and
+  /// shimmer as it moves. `medium` samples a mipmap chain, averaging the pixels
+  /// being skipped instead of ignoring them. `none` (nearest neighbour) is the
+  /// right answer for pixel art and exactly the wrong one here.
+  static final Paint _spritePaint = Paint()
+    ..filterQuality = FilterQuality.medium
+    ..isAntiAlias = true;
+
+  @override
+  void render(Canvas canvas) {
+    final ui.Image? image = game.carImage;
+    if (image == null) return;
+    _drawCar(canvas, image, game.model.carBox, game.size, _spritePaint);
+  }
+}
+
+/// The recorded best run, driving the same course at the same time.
+///
+/// Sits at [_ghostPriority]: over the pipes, so it can be seen at all, and
+/// under [_CarLayer], so it can never be mistaken for — or hide — the car the
+/// player is actually steering. That ordering is the whole design requirement
+/// for this component, and it is expressed as two numbers rather than as the
+/// order of two `canvas.draw` calls inside one `render`.
+class _GhostLayer extends Component with HasGameReference<FlappyMiataGame> {
+  _GhostLayer() : super(priority: _ghostPriority);
+
+  /// A flat, translucent silhouette rather than a faded copy of the sprite.
+  ///
+  /// `BlendMode.srcIn` replaces every pixel's colour with this one and keeps
+  /// its alpha, so the result is the car's exact SHAPE in a single colour. Two
+  /// reasons that is the right choice over simply lowering the opacity:
+  ///
+  ///  - It cannot be confused with the live car at a glance, even when the two
+  ///    overlap, which is exactly when confusion would cost the player a run.
+  ///  - It is unambiguous at any size and on any background. A 45%-opacity
+  ///    photograph of a car over a green pipe is a smear.
+  ///
+  /// The colour is the panel border's teal at half alpha — already in this
+  /// file's palette, and readable against both the sky and the pipes.
+  static final Paint _ghostPaint = Paint()
+    ..colorFilter =
+        const ColorFilter.mode(Color(0x8C8BD3C7), BlendMode.srcIn)
+    ..filterQuality = FilterQuality.medium
+    ..isAntiAlias = true;
+
+  @override
+  void render(Canvas canvas) {
+    final ui.Image? image = game.carImage;
+    final GameModel? ghost = game.ghostModel;
+    if (image == null || ghost == null) return;
+    _drawCar(canvas, image, ghost.carBox, game.size, _ghostPaint);
+  }
 }
 
 /// THE ONE CONVERSION THE MODEL REFUSES TO DO: a normalised box — 0..1 on both

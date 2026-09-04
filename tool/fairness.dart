@@ -106,6 +106,7 @@ library;
 
 import 'dart:typed_data';
 
+import 'package:flappymiata/game/course_seed.dart';
 import 'package:flappymiata/game/game_model.dart';
 
 /// The frame the prover and the game both step at.
@@ -178,23 +179,56 @@ class Course {
     this.playableByGame = false,
   });
 
-  /// The stretch of the shipped game's own course starting at obstacle
+  /// The stretch of the course produced by [pattern], starting at obstacle
   /// [firstIndex] and running for [count] obstacles.
   ///
-  /// Centres come from [GameModel.defaultGapCentre] put through
-  /// [GameModel.clampGapCentre] — the same two calls, in the same order, that
-  /// `GameModel._spawnAt` makes. Heights and spacing are the game's constants.
-  factory Course.fromDefaultPattern(int firstIndex, int count) => Course(
-    name: 'default[$firstIndex..${firstIndex + count - 1}]',
+  /// Centres are put through [GameModel.clampGapCentre] — the same two calls,
+  /// in the same order, that `GameModel._spawnAt` makes. Heights and spacing
+  /// are the game's constants, so the result is a course the game can really
+  /// produce and a witness can really be replayed through.
+  ///
+  /// WHY THIS TAKES A PATTERN RATHER THAN ONLY KNOWING ABOUT THE SHIPPED ONE:
+  /// the daily challenge is a second course generator, and it has to be held to
+  /// exactly the same fairness bar as the first. Making the prover able to take
+  /// any pattern is what stops there being a second prover for the second
+  /// generator — one prover, two inputs, one standard of evidence.
+  factory Course.fromPattern(
+    String name,
+    GapPattern pattern,
+    int firstIndex,
+    int count,
+  ) => Course(
+    name: name,
     gaps: List<CourseGap>.generate(
       count,
       (int k) => CourseGap(
-        GameModel.clampGapCentre(GameModel.defaultGapCentre(firstIndex + k)),
+        GameModel.clampGapCentre(pattern(firstIndex + k)),
         GameModel.gapHeight,
       ),
     ),
     playableByGame: true,
   );
+
+  /// The stretch of the shipped game's own course starting at obstacle
+  /// [firstIndex] and running for [count] obstacles.
+  factory Course.fromDefaultPattern(int firstIndex, int count) =>
+      Course.fromPattern(
+        'default[$firstIndex..${firstIndex + count - 1}]',
+        GameModel.defaultGapCentre,
+        firstIndex,
+        count,
+      );
+
+  /// The stretch of the course selected by [seed]. Seed 0 is the shipped
+  /// course, so `Course.fromSeed(0, a, b)` and
+  /// `Course.fromDefaultPattern(a, b)` are the same course.
+  factory Course.fromSeed(int seed, int firstIndex, int count) =>
+      Course.fromPattern(
+        'seed $seed [$firstIndex..${firstIndex + count - 1}]',
+        gapPatternForSeed(seed),
+        firstIndex,
+        count,
+      );
 
   /// The gap pattern that reproduces this course inside a real [GameModel].
   ///

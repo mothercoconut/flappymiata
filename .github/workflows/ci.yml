@@ -154,7 +154,12 @@ jobs:
   # GATE 2 — the whole test suite passes
   # ===========================================================================
   unit-tests:
-    name: Gate 2 - all 82 tests pass
+    # NAMED FOR THE PROPERTY, NOT FOR A COUNT. This job used to be called
+    # "all 82 tests pass" and was still called that at 167 tests, because
+    # nothing makes a number in a job name go red when it stops being true.
+    # A name that states the property it checks cannot drift; the actual count
+    # is in the step's own output, where it is generated rather than typed.
+    name: Gate 2 - the whole test suite passes
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -367,20 +372,55 @@ jobs:
         run: dart run tool/mutate.dart --selftest --timeout=180
 
       - name: Prove the suite still notices deliberate breakage
-        # The stratified subset: within each operator family, evenly spaced
-        # picks covering about an eighth of it, endpoints included. Selection is
-        # index arithmetic with no randomness and no clock, so the same commit
-        # always yields the same subset and anything CI flags can be reproduced
-        # locally with `--only=<id>`. A survivor — a mutant every test passed
-        # over — exits 1.
+        # The stratified subset: a fixed budget of 52 mutants, apportioned
+        # between the six operator families in proportion to their size with a
+        # floor of two each, then picked at evenly spaced indices within each
+        # family. Selection is integer arithmetic with no randomness and no
+        # clock, so the same commit always yields the same subset and anything
+        # CI flags can be reproduced locally with `--only=<id>`. A survivor — a
+        # mutant every test passed over — exits 1.
         #
-        # `--jobs=2` is sized for the smallest machine this can land on: a
-        # standard hosted Linux runner has 2 cores on a private repository (4 if
-        # the repository is public). Each job is a whole `flutter test` process
-        # working in its own sandbox copy of the package, so oversubscribing
-        # would not go faster; it would push every run closer to the timeout and
-        # make the verdicts mushier — and a timeout is the weakest kind of kill.
-        # Locally, on more cores, `--jobs=4` is the right number. If this
-        # repository is public, raising this to 4 is safe and roughly halves the
-        # step.
+        # WHY A BUDGET AND NOT A FRACTION, which is what this used to be. The
+        # old rule took an eighth of every family, so the subset was a fixed
+        # share of a surface that only grows. Four files were added to
+        # `lib/game/`, the surface went 410 -> 1225 mutants, and this step
+        # silently went 52 -> 154 mutants — tripling a job that has a
+        # 45-minute ceiling, in a commit that was about something else. The
+        # budget lives in `quickBudget` in the tool and pins the CI cost where
+        # it was measured.
+        #
+        # WHY `--jobs=2` IS STILL RIGHT AT 52 MUTANTS. It is sized for the
+        # machine, not for the workload: a standard hosted Linux runner has 2
+        # cores on a private repository (4 if the repository is public). Each
+        # job is a whole `flutter test` process working in its own sandbox copy
+        # of the package, so oversubscribing would not go faster; it would push
+        # every run closer to the timeout and make the verdicts mushier — and a
+        # timeout is the weakest kind of kill. If this repository is public,
+        # raising this to 4 is safe and roughly halves the step.
+        #
+        # WHY `--timeout=180` IS STILL RIGHT. Also sized for the machine rather
+        # than the workload: it is the ceiling on ONE `flutter test`, not on the
+        # step, so shrinking the subset does not make it less necessary. The
+        # first run of the job pays for compiling the whole test kernel on a
+        # cold, slow runner; a tight ceiling there converts an ordinary run into
+        # a timeout-kill, and a timeout-kill is evidence that the run did not
+        # finish, not evidence that the suite noticed anything.
+        #
+        # BUDGET AGAINST THE JOB TIMEOUT. Measured on the development machine at
+        # `--jobs=4`: 163.7s, 201.4s and 237.9s over three runs of the identical
+        # 52-mutant subset. Before the budget went in the same step was 670.3s.
+        #
+        # The spread is not noise in the measurement, it is the cost of the
+        # timeout-kills: those three runs scored 2, 7 and 8 mutants as
+        # KILLED(t/o), and a mutant that hangs the suite burns the whole
+        # `--timeout` before it is scored, while one that fails an assertion is
+        # done in seconds. Every one of them stayed a kill, so the verdict never
+        # moved — only the clock did.
+        #
+        # That is what to watch here, because this job raises the ceiling to
+        # 180s. Eight timeout-kills cost ~24 minutes of single-core time at that
+        # setting, or ~12 minutes across two jobs, on top of the ~6 minutes the
+        # other 44 mutants take. It fits inside 45 minutes with room to spare,
+        # but the margin is the reason the budget is 52 and not 154: at the old
+        # size this arithmetic did not fit at all.
         run: dart run tool/mutate.dart --quick --jobs=2 --timeout=180
